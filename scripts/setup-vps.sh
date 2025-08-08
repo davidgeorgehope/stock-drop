@@ -95,7 +95,7 @@ systemctl restart ${APP_NAME}-backend
 echo "--- Configuring Nginx ---"
 cat > "$NGINX_SITE" <<NGINX
 server {
-    listen 80;
+    listen 8080;
     server_name ${DOMAIN};
 
     # Serve static frontend
@@ -139,6 +139,13 @@ ln -sf "$NGINX_SITE" "$NGINX_SITE_LINK"
 nginx -t
 systemctl reload nginx
 
+# Open firewall port 8080 and close 80 if UFW is available
+if command -v ufw >/dev/null 2>&1; then
+  ufw allow 8080/tcp || true
+  ufw delete allow 80/tcp || true
+  ufw deny 80/tcp || true
+fi
+
 if [[ -n "$LE_EMAIL" ]]; then
   if ! command -v certbot >/dev/null 2>&1; then
     echo "--- Installing certbot (Let's Encrypt) ---"
@@ -152,4 +159,4 @@ echo "--- Done ---"
 echo "Next steps:"
 echo "1) Edit ${ENV_FILE} and set a real OPENAI_API_KEY"
 echo "2) systemctl restart ${APP_NAME}-backend"
-echo "3) Visit: http://${DOMAIN} (or https if certbot succeeded)"
+echo "3) Visit: http://${DOMAIN}:8080"
