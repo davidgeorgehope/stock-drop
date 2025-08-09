@@ -92,41 +92,44 @@ def _ensure_list_symbols(input_symbols: Union[str, List[str]]) -> List[str]:
 
 
 def _search_news_for_symbol(symbol: str, days: int, max_results: int) -> List[SourceItem]:
-    # Use Google News RSS directly for reliability
+    # Query DuckDuckGo News; no Google fallback
     try:
-        from urllib.parse import quote_plus
-        import re
-        import html as _html
-        import xml.etree.ElementTree as ET
-
-        rss_query = quote_plus(f"{symbol} stock when:{max(1, min(days, 30))}d")
-        url = f"https://news.google.com/rss/search?q={rss_query}&hl=en-US&gl=US&ceid=US:en"
-        resp = requests.get(url, timeout=10)
-        if resp.status_code != 200:
-            return []
-        root = ET.fromstring(resp.text)
-        channel = root.find("channel")
-        if channel is None:
-            return []
-        results: List[SourceItem] = []
-        for item in channel.findall("item")[:max_results]:
-            title_el = item.find("title")
-            link_el = item.find("link")
-            pub_el = item.find("pubDate")
-            desc_el = item.find("description")
-            title = title_el.text if title_el is not None else ""
-            link = link_el.text if link_el is not None else ""
-            published = pub_el.text if pub_el is not None else None
-            snippet_html = desc_el.text if desc_el is not None else None
-            snippet = None
-            if snippet_html:
-                snippet = re.sub(r"<[^>]+>", "", _html.unescape(snippet_html))
-            if link:
-                results.append(SourceItem(title=title or link, url=link, snippet=snippet, published=published))
-        return results
-    except Exception as e:
-        print(f"Google News RSS fetch failed for {symbol}: {e}")
+        # Import here to avoid hard dependency at module import time
+        from duckduckgo_search import DDGS  # type: ignore
+    except Exception as import_err:
+        print(f"DuckDuckGo search unavailable: {import_err}")
         return []
+
+    query = f"{symbol} stock"
+    timelimit = f"d{max(1, min(days, 30))}"
+    items: List[SourceItem] = []
+
+    attempts = 0
+    while attempts < 3 and len(items) == 0:
+        attempts += 1
+        try:
+            with DDGS() as ddgs:
+                for n in ddgs.news(
+                    query,
+                    region="us-en",
+                    safesearch="moderate",
+                    timelimit=timelimit,
+                    max_results=max_results,
+                ):
+                    items.append(
+                        SourceItem(
+                            title=(n.get("title") or ""),
+                            url=(n.get("url") or n.get("link") or ""),
+                            snippet=(n.get("excerpt") or n.get("body")),
+                            published=n.get("date"),
+                        )
+                    )
+        except Exception as e:
+            print(f"DDG news search attempt {attempts} failed for {symbol}: {e}")
+            time.sleep(0.8 * attempts)
+
+    cleaned = [i for i in items if i.url]
+    return cleaned
 
 
 def _build_llm_prompt(symbol: str, sources: List[SourceItem], tone: str, price_context: Optional[str] = None) -> str:

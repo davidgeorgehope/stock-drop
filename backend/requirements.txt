@@ -6,6 +6,7 @@ httpx
 python-dotenv
 openai
 requests
+duckduckgo-search
 boto3
 h2
 pytest
