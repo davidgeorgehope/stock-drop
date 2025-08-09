@@ -7,10 +7,6 @@ from fastapi.middleware.cors import CORSMiddleware
 from pydantic import BaseModel
 
 from openai import OpenAI
-try:
-    from ddgs import DDGS  # type: ignore
-except Exception:  # pragma: no cover - optional dependency warning safe-guard
-    DDGS = None  # type: ignore
 from dotenv import load_dotenv
 import requests
 import time
@@ -96,46 +92,13 @@ def _ensure_list_symbols(input_symbols: Union[str, List[str]]) -> List[str]:
 
 
 def _search_news_for_symbol(symbol: str, days: int, max_results: int) -> List[SourceItem]:
-    # Keep the query broad so we don't accidentally filter out relevant articles
-    query = f"{symbol} stock"
-    timelimit = f"d{max(1, min(days, 30))}"
-    items: List[SourceItem] = []
-    # Simple retry loop to handle transient rate limits
-    attempts = 0
-    while attempts < 3 and len(items) == 0:
-        attempts += 1
-        try:
-            if DDGS is not None:
-                with DDGS() as ddgs:
-                    # ddgs.news expects the query as the first positional argument (or named as 'query')
-                    for n in ddgs.news(query, region="us-en", safesearch="moderate", timelimit=timelimit, max_results=max_results):
-                        items.append(
-                            SourceItem(
-                                title=n.get("title") or "",
-                                url=n.get("url") or n.get("link") or "",
-                                snippet=n.get("excerpt") or n.get("body"),
-                                published=n.get("date"),
-                            )
-                        )
-        except Exception as e:
-            print(f"DDG news search attempt {attempts} failed for {symbol}: {e}")
-            # brief backoff
-            import time
-            time.sleep(0.8 * attempts)
-    cleaned = [i for i in items if i.url]
-    if cleaned:
-        return cleaned
-
-    # Fallback: Google News RSS
+    # Use Google News RSS directly for reliability
     try:
-        print(f"DDG returned no items for {symbol}. Falling back to Google News RSS…")
         from urllib.parse import quote_plus
-        import requests
         import re
         import html as _html
         import xml.etree.ElementTree as ET
 
-        # Add recent time window using when:{days}d
         rss_query = quote_plus(f"{symbol} stock when:{max(1, min(days, 30))}d")
         url = f"https://news.google.com/rss/search?q={rss_query}&hl=en-US&gl=US&ceid=US:en"
         resp = requests.get(url, timeout=10)
@@ -157,13 +120,12 @@ def _search_news_for_symbol(symbol: str, days: int, max_results: int) -> List[So
             snippet_html = desc_el.text if desc_el is not None else None
             snippet = None
             if snippet_html:
-                # strip HTML tags and unescape entities
                 snippet = re.sub(r"<[^>]+>", "", _html.unescape(snippet_html))
             if link:
                 results.append(SourceItem(title=title or link, url=link, snippet=snippet, published=published))
         return results
     except Exception as e:
-        print(f"Google News RSS fallback failed for {symbol}: {e}")
+        print(f"Google News RSS fetch failed for {symbol}: {e}")
         return []
 
 
@@ -237,136 +199,43 @@ class ChartResponse(BaseModel):
     volumes: List[Optional[int]]
 
 
-def _yahoo_headers() -> dict:
-    return {
-        "User-Agent": "Mozilla/5.0 (Macintosh; Intel Mac OS X 10_15_7) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/125.0.0.0 Safari/537.36",
-        "Accept": "application/json, text/plain, */*",
-        "Connection": "close",
-    }
-
-
 QUOTE_CACHE_TTL_SECONDS = int(os.getenv("QUOTE_CACHE_TTL_SECONDS", "60"))
 QUOTE_CACHE: dict[str, tuple[float, QuoteResponse]] = {}
 
 
 def _fetch_yahoo_quote(symbol: str) -> QuoteResponse:
-    # Cache check
+    # Simplified: Use Stooq as the sole data source
     now = time.time()
     cached = QUOTE_CACHE.get(symbol)
     if cached and (now - cached[0]) < QUOTE_CACHE_TTL_SECONDS:
         return cached[1]
-    url = f"https://query1.finance.yahoo.com/v7/finance/quote?symbols={symbol}"
-    try:
-        resp = requests.get(url, headers=_yahoo_headers(), timeout=8)
-        if resp.status_code != 200:
-            # Try Stooq fallback on common upstream failures
-            stooq = _fetch_stooq_history(symbol)
-            if stooq:
-                last = stooq[-1]
-                prev = stooq[-2] if len(stooq) > 1 else None
-                price = _safe_float(last.get("close"))
-                change = None
-                change_pct = None
-                if price is not None and prev is not None:
-                    prev_close = _safe_float(prev.get("close"))
-                    if prev_close not in (None, 0):
-                        change = price - prev_close
-                        change_pct = (change / prev_close) * 100.0
-                result = QuoteResponse(
-                    symbol=symbol,
-                    price=price,
-                    change=change,
-                    change_percent=change_pct,
-                    currency=None,
-                    market_time=(last.get("date_iso") or None),
-                    market_state="CLOSED",
-                    name=None,
-                )
-                QUOTE_CACHE[symbol] = (now, result)
-                return result
-            raise HTTPException(status_code=502, detail=f"Quote upstream error {resp.status_code}")
-        data = resp.json()
-        results = (data or {}).get("quoteResponse", {}).get("result", [])
-        if not results:
-            # Fallback to Stooq last close
-            stooq = _fetch_stooq_history(symbol)
-            if stooq:
-                last = stooq[-1]
-                prev = stooq[-2] if len(stooq) > 1 else None
-                price = _safe_float(last.get("close"))
-                change = None
-                change_pct = None
-                if price is not None and prev is not None:
-                    prev_close = _safe_float(prev.get("close"))
-                    if prev_close not in (None, 0):
-                        change = price - prev_close
-                        change_pct = (change / prev_close) * 100.0
-                result = QuoteResponse(
-                    symbol=symbol,
-                    price=price,
-                    change=change,
-                    change_percent=change_pct,
-                    currency=None,
-                    market_time=(last.get("date_iso") or None),
-                    market_state="CLOSED",
-                    name=None,
-                )
-                QUOTE_CACHE[symbol] = (now, result)
-                return result
-            empty = QuoteResponse(symbol=symbol)
-            QUOTE_CACHE[symbol] = (now, empty)
-            return empty
-        q = results[0]
-        ts = q.get("regularMarketTime")
-        market_time = None
-        if ts:
-            try:
-                market_time = datetime.fromtimestamp(int(ts), tz=timezone.utc).isoformat()
-            except Exception:
-                market_time = None
+    stooq = _fetch_stooq_history(symbol)
+    if stooq:
+        last = stooq[-1]
+        prev = stooq[-2] if len(stooq) > 1 else None
+        price = _safe_float(last.get("close"))
+        change = None
+        change_pct = None
+        if price is not None and prev is not None:
+            prev_close = _safe_float(prev.get("close"))
+            if prev_close not in (None, 0):
+                change = price - prev_close
+                change_pct = (change / prev_close) * 100.0
         result = QuoteResponse(
             symbol=symbol,
-            price=q.get("regularMarketPrice"),
-            change=q.get("regularMarketChange"),
-            change_percent=q.get("regularMarketChangePercent"),
-            currency=q.get("currency"),
-            market_time=market_time,
-            market_state=q.get("marketState"),
-            name=q.get("shortName") or q.get("longName"),
+            price=price,
+            change=change,
+            change_percent=change_pct,
+            currency=None,
+            market_time=(last.get("date_iso") or None),
+            market_state="CLOSED",
+            name=None,
         )
         QUOTE_CACHE[symbol] = (now, result)
         return result
-    except HTTPException:
-        raise
-    except Exception as e:
-        print(f"Quote fetch failed for {symbol}: {e}")
-        stooq = _fetch_stooq_history(symbol)
-        if stooq:
-            last = stooq[-1]
-            prev = stooq[-2] if len(stooq) > 1 else None
-            price = _safe_float(last.get("close"))
-            change = None
-            change_pct = None
-            if price is not None and prev is not None:
-                prev_close = _safe_float(prev.get("close"))
-                if prev_close not in (None, 0):
-                    change = price - prev_close
-                    change_pct = (change / prev_close) * 100.0
-            result = QuoteResponse(
-                symbol=symbol,
-                price=price,
-                change=change,
-                change_percent=change_pct,
-                currency=None,
-                market_time=(last.get("date_iso") or None),
-                market_state="CLOSED",
-                name=None,
-            )
-            QUOTE_CACHE[symbol] = (now, result)
-            return result
-        empty = QuoteResponse(symbol=symbol)
-        QUOTE_CACHE[symbol] = (now, empty)
-        return empty
+    empty = QuoteResponse(symbol=symbol)
+    QUOTE_CACHE[symbol] = (now, empty)
+    return empty
 
 
 CHART_CACHE_TTL_SECONDS = int(os.getenv("CHART_CACHE_TTL_SECONDS", "300"))
@@ -379,114 +248,35 @@ def _fetch_yahoo_chart(symbol: str, range_: str, interval: str) -> ChartResponse
     cached = CHART_CACHE.get(cache_key)
     if cached and (now - cached[0]) < CHART_CACHE_TTL_SECONDS:
         return cached[1]
-    # Yahoo uses "range" param values like: 1d,5d,1mo,3mo,6mo,1y,2y,5y,max
-    url = (
-        f"https://query1.finance.yahoo.com/v8/finance/chart/{symbol}?range={range_}&interval={interval}&includePrePost=false"
-    )
-    try:
-        resp = requests.get(url, headers=_yahoo_headers(), timeout=10)
-        if resp.status_code != 200:
-            # Fallback to Stooq for non-200
-            stooq = _fetch_stooq_history(symbol)
-            if stooq:
-                ts = [int(datetime.strptime(r["date"], "%Y-%m-%d").replace(tzinfo=timezone.utc).timestamp()) for r in stooq]
-                response = ChartResponse(
-                    symbol=symbol,
-                    range=range_,
-                    interval=interval,
-                    timestamps=ts,
-                    opens=[_safe_float(r.get("open")) for r in stooq],
-                    highs=[_safe_float(r.get("high")) for r in stooq],
-                    lows=[_safe_float(r.get("low")) for r in stooq],
-                    closes=[_safe_float(r.get("close")) for r in stooq],
-                    volumes=[_safe_int(r.get("volume")) for r in stooq],
-                )
-                CHART_CACHE[cache_key] = (now, response)
-                return response
-            raise HTTPException(status_code=502, detail=f"Chart upstream error {resp.status_code}")
-        data = resp.json()
-        result = ((data or {}).get("chart", {}) or {}).get("result")
-        if not result:
-            # Fallback to Stooq history (daily only)
-            stooq = _fetch_stooq_history(symbol)
-            if stooq:
-                ts = [int(datetime.strptime(r["date"], "%Y-%m-%d").replace(tzinfo=timezone.utc).timestamp()) for r in stooq]
-                response = ChartResponse(
-                    symbol=symbol,
-                    range=range_,
-                    interval=interval,
-                    timestamps=ts,
-                    opens=[_safe_float(r.get("open")) for r in stooq],
-                    highs=[_safe_float(r.get("high")) for r in stooq],
-                    lows=[_safe_float(r.get("low")) for r in stooq],
-                    closes=[_safe_float(r.get("close")) for r in stooq],
-                    volumes=[_safe_int(r.get("volume")) for r in stooq],
-                )
-                CHART_CACHE[cache_key] = (now, response)
-                return response
-            empty = ChartResponse(
-                symbol=symbol,
-                range=range_,
-                interval=interval,
-                timestamps=[],
-                opens=[],
-                highs=[],
-                lows=[],
-                closes=[],
-                volumes=[],
-            )
-            CHART_CACHE[cache_key] = (now, empty)
-            return empty
-        r0 = result[0]
-        timestamps = r0.get("timestamp", []) or []
-        indicators = (r0.get("indicators", {}) or {}).get("quote", [])
-        q0 = indicators[0] if indicators else {}
+    stooq = _fetch_stooq_history(symbol)
+    if stooq:
+        ts = [int(datetime.strptime(r["date"], "%Y-%m-%d").replace(tzinfo=timezone.utc).timestamp()) for r in stooq]
         response = ChartResponse(
             symbol=symbol,
             range=range_,
             interval=interval,
-            timestamps=timestamps,
-            opens=q0.get("open", []) or [],
-            highs=q0.get("high", []) or [],
-            lows=q0.get("low", []) or [],
-            closes=q0.get("close", []) or [],
-            volumes=q0.get("volume", []) or [],
+            timestamps=ts,
+            opens=[_safe_float(r.get("open")) for r in stooq],
+            highs=[_safe_float(r.get("high")) for r in stooq],
+            lows=[_safe_float(r.get("low")) for r in stooq],
+            closes=[_safe_float(r.get("close")) for r in stooq],
+            volumes=[_safe_int(r.get("volume")) for r in stooq],
         )
         CHART_CACHE[cache_key] = (now, response)
         return response
-    except HTTPException:
-        raise
-    except Exception as e:
-        print(f"Chart fetch failed for {symbol}: {e}")
-        stooq = _fetch_stooq_history(symbol)
-        if stooq:
-            ts = [int(datetime.strptime(r["date"], "%Y-%m-%d").replace(tzinfo=timezone.utc).timestamp()) for r in stooq]
-            response = ChartResponse(
-                symbol=symbol,
-                range=range_,
-                interval=interval,
-                timestamps=ts,
-                opens=[_safe_float(r.get("open")) for r in stooq],
-                highs=[_safe_float(r.get("high")) for r in stooq],
-                lows=[_safe_float(r.get("low")) for r in stooq],
-                closes=[_safe_float(r.get("close")) for r in stooq],
-                volumes=[_safe_int(r.get("volume")) for r in stooq],
-            )
-            CHART_CACHE[cache_key] = (now, response)
-            return response
-        empty = ChartResponse(
-            symbol=symbol,
-            range=range_,
-            interval=interval,
-            timestamps=[],
-            opens=[],
-            highs=[],
-            lows=[],
-            closes=[],
-            volumes=[],
-        )
-        CHART_CACHE[cache_key] = (now, empty)
-        return empty
+    empty = ChartResponse(
+        symbol=symbol,
+        range=range_,
+        interval=interval,
+        timestamps=[],
+        opens=[],
+        highs=[],
+        lows=[],
+        closes=[],
+        volumes=[],
+    )
+    CHART_CACHE[cache_key] = (now, empty)
+    return empty
 
 
 def _safe_float(v):

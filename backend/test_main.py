@@ -48,35 +48,36 @@ def test_analyze_basic_flow(monkeypatch: pytest.MonkeyPatch):
     assert isinstance(data["results"][0]["summary"], str)
 
 
-def test_quote_endpoint_graceful(monkeypatch: pytest.MonkeyPatch):
-    # Force upstream 429
-    class DummyResp:
-        status_code = 429
+def test_quote_endpoint_ok(monkeypatch: pytest.MonkeyPatch):
+    # Stooq-only path: stub history to deterministic values
+    from main import _fetch_stooq_history
 
-        def json(self) -> Any:
-            return {}
-
-    monkeypatch.setattr("requests.get", lambda *a, **kw: DummyResp())
-    r = client.get("/quote/AAPL")
+    monkeypatch.setattr(
+        "main._fetch_stooq_history",
+        lambda sym: [
+            {"date": "2024-01-01", "date_iso": "2024-01-01T00:00:00+00:00", "open": 10, "high": 11, "low": 9, "close": 10, "volume": 1000},
+            {"date": "2024-01-02", "date_iso": "2024-01-02T00:00:00+00:00", "open": 10, "high": 12, "low": 9, "close": 11, "volume": 900},
+        ],
+    )
+    r = client.get("/quote/TEST")
     assert r.status_code == 200
     data = r.json()
-    assert data["symbol"] == "AAPL"
-    # Should be empty fields when rate limited
-    assert data.get("price") is None
+    assert data["symbol"] == "TEST"
+    assert data["price"] == 11
 
 
-def test_chart_endpoint_graceful(monkeypatch: pytest.MonkeyPatch):
-    # Force upstream 429
-    class DummyResp:
-        status_code = 429
-
-        def json(self) -> Any:
-            return {}
-
-    monkeypatch.setattr("requests.get", lambda *a, **kw: DummyResp())
+def test_chart_endpoint_ok(monkeypatch: pytest.MonkeyPatch):
+    # Stooq-only path: stub history to deterministic series
+    monkeypatch.setattr(
+        "main._fetch_stooq_history",
+        lambda sym: [
+            {"date": "2024-01-01", "date_iso": "2024-01-01T00:00:00+00:00", "open": 10, "high": 11, "low": 9, "close": 10, "volume": 1000},
+            {"date": "2024-01-02", "date_iso": "2024-01-02T00:00:00+00:00", "open": 10, "high": 12, "low": 9, "close": 11, "volume": 900},
+        ],
+    )
     r = client.get("/chart/TSLA?range=1mo&interval=1d")
     assert r.status_code == 200
     data = r.json()
     assert data["symbol"] == "TSLA"
-    assert data["timestamps"] == []
+    assert data["closes"] == [10, 11]
 
