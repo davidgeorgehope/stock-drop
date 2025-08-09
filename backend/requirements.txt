@@ -9,3 +9,4 @@ requests
 boto3
 h2
 ddgs
+pytest

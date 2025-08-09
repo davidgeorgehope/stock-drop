@@ -1,12 +1,15 @@
 import { useState } from 'react'
 import Header from './components/Header'
 import { API_BASE_URL } from './config'
+import Sparkline from './components/Sparkline'
 
 function App() {
   const [symbols, setSymbols] = useState('')
   const [results, setResults] = useState([])
   const [loading, setLoading] = useState(false)
   const [error, setError] = useState('')
+  const [quotes, setQuotes] = useState({})
+  const [charts, setCharts] = useState({})
 
   const onAnalyze = async () => {
     const input = symbols.trim()
@@ -28,7 +31,36 @@ function App() {
         throw new Error(`${response.status}: ${txt}`)
       }
       const data = await response.json()
-      setResults(data.results || [])
+      const analysisResults = data.results || []
+      setResults(analysisResults)
+      // Fetch quotes and mini charts in parallel for each symbol
+      const syms = analysisResults.map(r => r.symbol)
+      await Promise.all([
+        (async () => {
+          const entries = await Promise.all(syms.map(async (s) => {
+            try {
+              const r = await fetch(`${API_BASE_URL}/quote/${encodeURIComponent(s)}`)
+              if (!r.ok) throw new Error('quote failed')
+              return [s, await r.json()]
+            } catch {
+              return [s, null]
+            }
+          }))
+          setQuotes(Object.fromEntries(entries))
+        })(),
+        (async () => {
+          const entries = await Promise.all(syms.map(async (s) => {
+            try {
+              const r = await fetch(`${API_BASE_URL}/chart/${encodeURIComponent(s)}?range=1mo&interval=1d`)
+              if (!r.ok) throw new Error('chart failed')
+              return [s, await r.json()]
+            } catch {
+              return [s, null]
+            }
+          }))
+          setCharts(Object.fromEntries(entries))
+        })()
+      ])
     } catch (e) {
       setError(e.message || 'Something went sideways')
     } finally {
@@ -66,7 +98,24 @@ function App() {
           {results.map((r) => (
             <div key={r.symbol} className="bg-gray-800 p-6 rounded-lg shadow-lg">
               <div className="flex items-center justify-between mb-3">
-                <h2 className="text-2xl font-bold">{r.symbol}</h2>
+                <div className="flex items-center gap-4">
+                  <h2 className="text-2xl font-bold">{r.symbol}</h2>
+                  {quotes[r.symbol] && (
+                    <div className="text-sm text-gray-300">
+                      <span className="font-semibold mr-2">{quotes[r.symbol]?.price?.toFixed?.(2)} {quotes[r.symbol]?.currency || ''}</span>
+                      {typeof quotes[r.symbol]?.change === 'number' && (
+                        <span className={quotes[r.symbol].change >= 0 ? 'text-green-400' : 'text-red-400'}>
+                          {quotes[r.symbol].change >= 0 ? '+' : ''}{quotes[r.symbol].change.toFixed(2)} ({(quotes[r.symbol]?.change_percent || 0).toFixed(2)}%)
+                        </span>
+                      )}
+                    </div>
+                  )}
+                </div>
+                <div>
+                  {charts[r.symbol]?.closes && charts[r.symbol]?.closes.length > 1 && (
+                    <Sparkline data={charts[r.symbol].closes} width={200} height={48} />
+                  )}
+                </div>
               </div>
               <div className="prose prose-invert max-w-none whitespace-pre-wrap leading-relaxed">
                 {r.summary}
