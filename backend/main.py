@@ -673,6 +673,24 @@ async def og_image(symbol: str) -> Response:
     return Response(content=image_bytes, media_type="image/png", headers=headers)
 
 
+@app.post("/og-image/warm/{symbol}")
+async def og_image_warm(symbol: str) -> Response:
+    """Pre-generate and cache the OG image for a symbol without returning the bytes.
+
+    Returns 201 if a new image was generated, 204 if a fresh cached image already exists.
+    """
+    symbol = _sanitize_symbol(symbol)
+    if not symbol:
+        raise HTTPException(status_code=400, detail="Symbol is required")
+    now = time.time()
+    cached = OG_IMAGE_CACHE.get(symbol)
+    if cached and (now - cached[0]) < OG_IMAGE_CACHE_TTL_SECONDS:
+        return Response(status_code=204)
+    image_bytes = _generate_og_image_png(symbol)
+    OG_IMAGE_CACHE[symbol] = (time.time(), image_bytes)
+    return Response(status_code=201)
+
+
 @app.get("/s/{symbol}")
 async def share(symbol: str, request: Request) -> Response:
     symbol = _sanitize_symbol(symbol)

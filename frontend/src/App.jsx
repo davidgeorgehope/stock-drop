@@ -17,6 +17,22 @@ function App() {
       setError('Please enter at least one stock symbol')
       return
     }
+    // Kick off OG image generation immediately so previews are ready when results render
+    try {
+      const warmSymbols = Array.from(new Set(
+        input
+          .split(/[\s,]+/)
+          .map((s) => s.trim().toUpperCase())
+          .filter(Boolean)
+      ))
+      ;(async () => {
+        await Promise.allSettled(
+          warmSymbols.map((s) =>
+            fetch(`${API_BASE_URL}/og-image/warm/${encodeURIComponent(s)}`, { method: 'POST' })
+          )
+        )
+      })()
+    } catch {}
     setLoading(true)
     setError('')
     setResults([])
