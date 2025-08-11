@@ -30,7 +30,8 @@ NGINX_SITE_LINK="/etc/nginx/sites-enabled/${APP_NAME}.conf"
 echo "--- Installing system packages ---"
 export DEBIAN_FRONTEND=noninteractive
 apt-get update -y
-apt-get install -y python3 python3-venv python3-pip nginx curl gnupg ca-certificates lsb-release
+apt-get install -y python3 python3-venv python3-pip nginx curl gnupg ca-certificates lsb-release \
+  fonts-noto-core fonts-ubuntu fontconfig
 
 if ! command -v node >/dev/null 2>&1; then
   echo "--- Installing Node.js 20.x ---"
@@ -68,6 +69,18 @@ fi
 if ! grep -q "^OPENAI_API_KEY=" "$ENV_FILE" 2>/dev/null; then
   echo "OPENAI_API_KEY=CHANGE_ME" >> "$ENV_FILE"
 fi
+
+# Prefer a known, scalable font for OG image rendering
+if ! grep -q "^OG_FONT_PATH=" "$ENV_FILE" 2>/dev/null; then
+  if [[ -f "/usr/share/fonts/truetype/noto/NotoSans-Regular.ttf" ]]; then
+    echo "OG_FONT_PATH=/usr/share/fonts/truetype/noto/NotoSans-Regular.ttf" >> "$ENV_FILE"
+  elif [[ -f "/usr/share/fonts/truetype/ubuntu/Ubuntu-R.ttf" ]]; then
+    echo "OG_FONT_PATH=/usr/share/fonts/truetype/ubuntu/Ubuntu-R.ttf" >> "$ENV_FILE"
+  fi
+fi
+
+# Rebuild font cache so newly installed fonts are discoverable
+fc-cache -f >/dev/null 2>&1 || true
 
 echo "--- Creating systemd service ---"
 cat > "$SERVICE_FILE" <<SYSTEMD
