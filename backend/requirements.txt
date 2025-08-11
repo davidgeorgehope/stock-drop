@@ -4,10 +4,11 @@ pydantic
 PyYAML
 httpx
 python-dotenv
-openai
+openai>=1.0.0
 requests
 duckduckgo-search
 boto3
 h2
 pytest
 pytest
+Pillow

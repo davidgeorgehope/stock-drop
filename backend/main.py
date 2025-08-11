@@ -2,7 +2,7 @@ from datetime import datetime, timezone, date
 import os
 from typing import List, Optional, Union
 
-from fastapi import FastAPI, HTTPException, Query
+from fastapi import FastAPI, HTTPException, Query, Request, Response
 from fastapi.middleware.cors import CORSMiddleware
 from pydantic import BaseModel
 
@@ -11,7 +11,10 @@ from dotenv import load_dotenv
 import requests
 import time
 import csv
-from io import StringIO
+from io import StringIO, BytesIO
+from hashlib import md5
+from PIL import Image, ImageDraw, ImageFont
+import textwrap
 
 # Load env vars from a local .env if present (dev convenience)
 load_dotenv()
@@ -132,7 +135,13 @@ def _search_news_for_symbol(symbol: str, days: int, max_results: int) -> List[So
     return cleaned
 
 
-def _build_llm_prompt(symbol: str, sources: List[SourceItem], tone: str, price_context: Optional[str] = None) -> str:
+def _build_llm_prompt(
+    symbol: str,
+    sources: List[SourceItem],
+    tone: str,
+    price_context: Optional[str] = None,
+    max_words: Optional[int] = None,
+) -> str:
     headline_lines = [f"- {s.title} ({s.url})" for s in sources[:10]]
     snippets = [f"{s.title}: {s.snippet}" for s in sources if s.snippet]
     headlines_block = "\n".join(headline_lines) or "(no recent articles found)"
@@ -146,6 +155,11 @@ def _build_llm_prompt(symbol: str, sources: List[SourceItem], tone: str, price_c
         f"Output guidelines:\n"
         f"- 2–4 short paragraphs max\n- Include 1–2 tongue-in-cheek jokes\n- If uncertainty remains, say so\n"
     )
+    if max_words is not None:
+        prompt += (
+            f"- HARD LIMIT: Keep the entire response under {max_words} words; fewer is better for a social preview image.\n"
+            f"- Prioritize brevity and clarity. Use short sentences.\n"
+        )
     return prompt
 
 
@@ -380,6 +394,223 @@ def _get_price_context(symbol: str) -> Optional[str]:
     return "\n".join(lines) if lines else None
 
 
+def _sanitize_symbol(symbol: str) -> str:
+    s = (symbol or "").strip().upper()
+    allowed = "ABCDEFGHIJKLMNOPQRSTUVWXYZ0123456789.-"
+    s = "".join(ch for ch in s if ch in allowed)
+    return s
+
+
+OG_IMAGE_CACHE_TTL_SECONDS = int(os.getenv("OG_IMAGE_CACHE_TTL_SECONDS", "1800"))
+OG_IMAGE_CACHE: dict[str, tuple[float, bytes]] = {}
+
+
+def _generate_og_image_png(symbol: str) -> bytes:
+    # Match the actual site's look - dark background, detailed commentary
+    width, height = 1200, 630
+    
+    quote = _fetch_yahoo_quote(symbol)
+    chart = _fetch_yahoo_chart(symbol, range_="1mo", interval="1d")
+    closes = [c for c in (chart.closes or []) if isinstance(c, (int, float))]
+
+    # Site-matching colors
+    bg = (15, 18, 24)  # Dark blue-gray like the site
+    white = (255, 255, 255)
+    gray = (156, 163, 175)
+    red = (248, 113, 113)  # Softer red like site
+    green = (34, 197, 94)
+    
+    img = Image.new("RGB", (width, height), bg)
+    draw = ImageDraw.Draw(img)
+
+    # Font setup
+    def _load_font(size: int):
+        """Load a scalable TrueType font so size changes actually apply.
+
+        Falls back through common system font paths and an OG_FONT_PATH env var.
+        If none are available, uses PIL's default bitmap font (fixed size).
+        """
+        # Allow override via env var
+        env_font = os.getenv("OG_FONT_PATH")
+        candidates = [env_font] if env_font else []
+        # Common locations
+        candidates.extend([
+            "DejaVuSans.ttf",
+            "/usr/share/fonts/truetype/dejavu/DejaVuSans.ttf",
+            "/usr/share/fonts/truetype/liberation/LiberationSans-Regular.ttf",
+            "/usr/share/fonts/truetype/freefont/FreeSans.ttf",
+            "/Library/Fonts/Arial.ttf",
+            "/System/Library/Fonts/Supplemental/Arial.ttf",
+            "/System/Library/Fonts/Supplemental/Helvetica.ttf",
+        ])
+        for path in candidates:
+            try:
+                if path and os.path.exists(path) or path and not os.path.isabs(path):
+                    return ImageFont.truetype(path, size)
+            except Exception:
+                continue
+        # Try PIL's bundled DejaVu
+        try:
+            import PIL  # type: ignore
+            pil_dir = os.path.dirname(PIL.__file__)
+            bundled = os.path.join(pil_dir, "fonts", "DejaVuSans.ttf")
+            return ImageFont.truetype(bundled, size)
+        except Exception:
+            pass
+        # Last resort (fixed size)
+        return ImageFont.load_default()
+
+    # Slightly larger fonts so preview text is easier to read
+    big_font = _load_font(56)
+    med_font = _load_font(36)
+    small_font = _load_font(28)
+    tiny_font = _load_font(20)
+
+    # ASCII-safe text
+    def _clean_text(text: str) -> str:
+        text = text.replace("\u2014", "-").replace("\u2013", "-")
+        return text.encode("ascii", "ignore").decode("ascii")
+
+    # Layout: symbol + price on top row, chart on right, commentary filling left
+    # Top row: Symbol and price
+    padding = 40
+    y = 40
+    
+    # Symbol
+    draw.text((padding, y), _clean_text(symbol), font=big_font, fill=white)
+    
+    # Price on same line, right side
+    if quote.price is not None:
+        chg = quote.change or 0.0
+        chg_pct = quote.change_percent or 0.0
+        price_color = red if chg < 0 else green
+        price_text = f"${quote.price:.2f}  {chg:+.2f} ({chg_pct:+.2f}%)"
+        # Measure text to position it right-aligned
+        bbox = draw.textbbox((0, 0), _clean_text(price_text), font=med_font)
+        price_width = bbox[2] - bbox[0]
+        draw.text((width - padding - price_width, y + 5), _clean_text(price_text), font=med_font, fill=price_color)
+    
+    # Chart area - compact, top right
+    # Move chart down a touch to make room for the larger title/price row
+    chart_y = y + 80
+    chart_height = 180
+    chart_width = 400
+    chart_left = width - padding - chart_width
+    chart_right = width - padding
+    chart_top = chart_y
+    chart_bottom = chart_y + chart_height
+    
+    if len(closes) >= 2:
+        # Sparkline similar to site
+        min_close = min(closes)
+        max_close = max(closes)
+        price_range = max_close - min_close if max_close != min_close else 1
+        
+        points = []
+        for i, price in enumerate(closes):
+            x = chart_left + (i / (len(closes) - 1)) * chart_width
+            y_norm = (price - min_close) / price_range
+            y = chart_bottom - (y_norm * chart_height)
+            points.append((x, y))
+        
+        # Chart line - match site style
+        line_color = red if closes[-1] < closes[0] else green
+        draw.line(points, fill=line_color, width=3)
+        
+        # High/Low labels like site
+        draw.text((chart_right - 100, chart_top - 25), f"High: ${max_close:.2f}", font=tiny_font, fill=gray)
+        draw.text((chart_right - 100, chart_bottom + 5), f"Low: ${min_close:.2f}", font=tiny_font, fill=gray)
+    
+    # Commentary - get actual analysis like the site shows
+    def _get_full_commentary() -> str:
+        try:
+            # Try to get actual analysis from the backend
+            sources = _search_news_for_symbol(symbol, days=7, max_results=8)
+            price_ctx = _get_price_context(symbol)
+            # Keep OG image preview succinct
+            prompt = _build_llm_prompt(symbol, sources, "humorous", price_ctx, max_words=80)
+            analysis = _call_openai(prompt)
+            if analysis and len(analysis.strip()) > 20:
+                return analysis.strip()
+        except Exception:
+            pass
+        return f"The market's been rough on {symbol} lately. Between earnings volatility, analyst downgrades, and general market jitters, it's showing the classic signs of a stock in consolidation mode. Recent price action suggests investors are taking profits and reassessing valuations amid broader market uncertainty."
+    
+    commentary = _clean_text(_get_full_commentary())
+    # Safety net: trim to max words to avoid awkward mid-word cuts
+    def _trim_words(text: str, max_words: int) -> str:
+        words = text.split()
+        if len(words) <= max_words:
+            return text
+        return " ".join(words[:max_words]) + "…"
+
+    commentary = _trim_words(commentary, 85)
+    
+    # Commentary area - left side, flowing around chart
+    text_left = padding
+    text_right = chart_left - 20  # Leave gap before chart
+    text_top = chart_y
+    text_width = text_right - text_left
+    
+    # Wrap text carefully
+    wrapped_lines = []
+    words = commentary.split()
+    current_line = ""
+    
+    for word in words:
+        test_line = current_line + (" " if current_line else "") + word
+        bbox = draw.textbbox((0, 0), test_line, font=small_font)
+        line_width = bbox[2] - bbox[0]
+        
+        if line_width <= text_width:
+            current_line = test_line
+        else:
+            if current_line:
+                wrapped_lines.append(current_line)
+            current_line = word
+    
+    if current_line:
+        wrapped_lines.append(current_line)
+    
+    # Draw commentary lines with dynamic height based on font metrics
+    bbox_sample = draw.textbbox((0, 0), "Ag", font=small_font)
+    line_height = (bbox_sample[3] - bbox_sample[1]) + 8
+    y = text_top
+    for line in wrapped_lines:
+        if y > height - 60:  # Don't go too close to bottom
+            break
+        draw.text((text_left, y), line, font=small_font, fill=white)
+        y += line_height
+    
+    # Footer
+    draw.text((padding, height - 30), "whyisthestockplummeting.com", font=tiny_font, fill=gray)
+    
+    buf = BytesIO()
+    img.save(buf, format="PNG", optimize=True)
+    return buf.getvalue()
+
+
+def _build_share_description(symbol: str) -> str:
+    parts: List[str] = []
+    price_ctx = _get_price_context(symbol)
+    if price_ctx:
+        parts.append(price_ctx)
+    # Add up to two recent headlines for flavor
+    try:
+        news = _search_news_for_symbol(symbol, days=7, max_results=3)
+        if news:
+            titles = [n.title for n in news[:2] if n.title]
+            if titles:
+                parts.append("; ".join(titles))
+    except Exception:
+        pass
+    if not parts:
+        parts.append("Tap to see a quick chart and summary.")
+    # Keep description short for social previews
+    desc = " — ".join(parts)
+    return desc[:280]
+
+
 @app.post("/analyze", response_model=AnalyzeResponse)
 async def analyze(request: AnalyzeRequest) -> AnalyzeResponse:
     symbols = _ensure_list_symbols(request.symbols)
@@ -410,13 +641,82 @@ async def get_quote(symbol: str) -> QuoteResponse:
 @app.get("/chart/{symbol}", response_model=ChartResponse)
 async def get_chart(
     symbol: str,
-    range: str = Query("1mo", regex=r"^(1d|5d|1mo|3mo|6mo|1y|2y|5y|max)$"),
-    interval: str = Query("1d", regex=r"^(1m|2m|5m|15m|30m|60m|90m|1h|1d|1wk|1mo|3mo)$"),
+    range: str = Query("1mo", pattern=r"^(1d|5d|1mo|3mo|6mo|1y|2y|5y|max)$"),
+    interval: str = Query("1d", pattern=r"^(1m|2m|5m|15m|30m|60m|90m|1h|1d|1wk|1mo|3mo)$"),
 ) -> ChartResponse:
     symbol = (symbol or "").strip().upper()
     if not symbol:
         raise HTTPException(status_code=400, detail="Symbol is required")
     return _fetch_yahoo_chart(symbol, range, interval)
+
+
+@app.get("/og-image/{symbol}.png")
+async def og_image(symbol: str) -> Response:
+    symbol = _sanitize_symbol(symbol)
+    if not symbol:
+        raise HTTPException(status_code=400, detail="Symbol is required")
+    now = time.time()
+    cached = OG_IMAGE_CACHE.get(symbol)
+    if cached and (now - cached[0]) < OG_IMAGE_CACHE_TTL_SECONDS:
+        image_bytes = cached[1]
+    else:
+        image_bytes = _generate_og_image_png(symbol)
+        OG_IMAGE_CACHE[symbol] = (now, image_bytes)
+    etag = md5(image_bytes).hexdigest()
+    headers = {
+        "Cache-Control": "public, max-age=1800",
+        "ETag": etag,
+    }
+    return Response(content=image_bytes, media_type="image/png", headers=headers)
+
+
+@app.get("/s/{symbol}")
+async def share(symbol: str, request: Request) -> Response:
+    symbol = _sanitize_symbol(symbol)
+    if not symbol:
+        raise HTTPException(status_code=400, detail="Symbol is required")
+    origin = os.getenv("PUBLIC_WEB_ORIGIN")
+    try:
+        image_url = str(request.url_for("og_image", symbol=symbol))  # type: ignore[arg-type]
+    except Exception:
+        image_url = f"/og-image/{symbol}.png"
+    if origin and image_url.startswith("/"):
+        image_url = origin.rstrip("/") + image_url
+    title = f"{symbol} — Why Is The Stock Plummeting?"
+    description = _build_share_description(symbol)
+    canonical = f"{(origin or '').rstrip('/')}/?stock={symbol}" if origin else f"/?stock={symbol}"
+    html = f"""
+<!doctype html>
+<html lang=\"en\">
+<head>
+  <meta charset=\"utf-8\">
+  <meta name=\"viewport\" content=\"width=device-width, initial-scale=1\">
+  <title>{title}</title>
+  <link rel=\"canonical\" href=\"{canonical}\" />
+  <meta name=\"description\" content=\"{description}\" />
+  <meta property=\"og:type\" content=\"website\" />
+  <meta property=\"og:site_name\" content=\"Why Is The Stock Plummeting?\" />
+  <meta property=\"og:title\" content=\"{title}\" />
+  <meta property=\"og:description\" content=\"{description}\" />
+  <meta property=\"og:image\" content=\"{image_url}\" />
+  <meta name=\"twitter:card\" content=\"summary_large_image\" />
+  <meta name=\"twitter:title\" content=\"{title}\" />
+  <meta name=\"twitter:description\" content=\"{description}\" />
+  <meta name=\"twitter:image\" content=\"{image_url}\" />
+  <meta http-equiv=\"refresh\" content=\"0;url={canonical}\" />
+  <style>body{{background:#0f1218;color:#eef;font-family:system-ui, -apple-system, Segoe UI, Roboto, Ubuntu, Cantarell, Noto Sans, sans-serif}}.wrap{{max-width:720px;margin:80px auto;padding:0 16px}}</style>
+  </head>
+<body>
+  <div class=\"wrap\">
+    <h1>{title}</h1>
+    <p>{description}</p>
+    <img src=\"{image_url}\" alt=\"{symbol} chart\" width=\"600\" />
+    <p>Redirecting to the app… If it doesn't, <a href=\"{canonical}\">click here</a>.</p>
+  </div>
+</body>
+</html>
+"""
+    return Response(content=html, media_type="text/html; charset=utf-8")
 
 
 @app.get("/")
