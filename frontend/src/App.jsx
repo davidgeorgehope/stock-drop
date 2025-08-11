@@ -97,26 +97,18 @@ function App() {
         <div className="space-y-6">
           {results.map((r) => (
             <div key={r.symbol} className="bg-gray-800 p-6 rounded-lg shadow-lg">
-              <div className="flex items-center justify-between mb-3">
-                <div className="flex items-center gap-4">
-                  <h2 className="text-2xl font-bold">{r.symbol}</h2>
-                  {quotes[r.symbol] && (
-                    <div className="text-sm text-gray-300">
-                      <span className="font-semibold mr-2">{quotes[r.symbol]?.price?.toFixed?.(2)} {quotes[r.symbol]?.currency || ''}</span>
-                      {typeof quotes[r.symbol]?.change === 'number' && (
-                        <span className={quotes[r.symbol].change >= 0 ? 'text-green-400' : 'text-red-400'}>
-                          {quotes[r.symbol].change >= 0 ? '+' : ''}{quotes[r.symbol].change.toFixed(2)} ({(quotes[r.symbol]?.change_percent || 0).toFixed(2)}%)
-                        </span>
-                      )}
-                    </div>
-                  )}
-                </div>
-                <div>
-                  {charts[r.symbol]?.closes && charts[r.symbol]?.closes.length > 1 && (
-                    <Sparkline data={charts[r.symbol].closes} width={200} height={48} />
-                  )}
-                </div>
+              
+
+              {/* OG preview image from backend */}
+              <div className="mb-4">
+                <img
+                  src={`${API_BASE_URL}/og-image/${encodeURIComponent(r.symbol)}.png`}
+                  alt={`${r.symbol} preview`}
+                  className="w-full rounded-md border border-gray-700"
+                  loading="lazy"
+                />
               </div>
+
               <div className="prose prose-invert max-w-none whitespace-pre-wrap leading-relaxed">
                 {r.summary}
               </div>
