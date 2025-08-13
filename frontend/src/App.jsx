@@ -1,7 +1,8 @@
-import { useState } from 'react'
+import { useState, useRef, useEffect } from 'react'
 import Header from './components/Header'
 import { API_BASE_URL } from './config'
 import Sparkline from './components/Sparkline'
+import BiggestLosers from './components/BiggestLosers'
 
 function App() {
   const [symbols, setSymbols] = useState('')
@@ -10,9 +11,18 @@ function App() {
   const [error, setError] = useState('')
   const [quotes, setQuotes] = useState({})
   const [charts, setCharts] = useState({})
+  const resultsRef = useRef(null)
 
-  const onAnalyze = async () => {
-    const input = symbols.trim()
+  const handleLoserClick = (symbol) => {
+    // Set the clicked symbol in the input and trigger analysis
+    setSymbols(symbol)
+    setError('')
+    onAnalyze(symbol)
+  }
+
+  const onAnalyze = async (symbolsInput = null) => {
+    const candidate = typeof symbolsInput === 'string' ? symbolsInput : symbols
+    const input = (candidate || '').trim()
     if (!input) {
       setError('Please enter at least one stock symbol')
       return
@@ -84,25 +94,31 @@ function App() {
     }
   }
 
+  useEffect(() => {
+    if (resultsRef.current && results.length > 0) {
+      resultsRef.current.scrollIntoView({ behavior: 'smooth', block: 'start' })
+    }
+  }, [results])
+
   return (
     <div className="bg-gray-900 text-white min-h-screen font-sans p-8">
       <div className="max-w-3xl mx-auto">
         <Header />
 
-        <div className="bg-gray-800 p-6 rounded-lg shadow-lg mb-8">
+        <div className="bg-gray-800 p-6 rounded-lg shadow-lg mb-8 overflow-hidden">
           <label className="block text-sm text-gray-300 mb-2">Enter stock symbols (comma or space separated)</label>
-          <div className="flex gap-3">
+          <div className="flex flex-col sm:flex-row gap-3">
             <input
               value={symbols}
               onChange={(e) => setSymbols(e.target.value)}
               placeholder="AAPL, TSLA, NVDA"
               onKeyDown={(e) => { if (e.key === 'Enter') onAnalyze() }}
-              className="flex-1 p-3 bg-gray-700 rounded-md border border-gray-600 focus:outline-none focus:ring-2 focus:ring-blue-500 text-gray-200 placeholder-gray-400"
+              className="w-full sm:flex-1 min-w-0 p-3 bg-gray-700 rounded-md border border-gray-600 focus:outline-none focus:ring-2 focus:ring-blue-500 text-gray-200 placeholder-gray-400"
             />
             <button
-              onClick={onAnalyze}
+              onClick={() => onAnalyze()}
               disabled={loading}
-              className="px-6 py-2 bg-blue-600 text-white rounded-md hover:bg-blue-700 disabled:bg-gray-600 font-semibold"
+              className="w-full sm:w-auto whitespace-nowrap px-6 py-2 bg-blue-600 text-white rounded-md hover:bg-blue-700 disabled:bg-gray-600 font-semibold"
             >
               {loading ? 'Investigating…' : 'Why did it drop?'}
             </button>
@@ -110,7 +126,9 @@ function App() {
           {error && <p className="text-red-400 mt-3">{error}</p>}
         </div>
 
-        <div className="space-y-6">
+        {results.length === 0 && <BiggestLosers onStockClick={handleLoserClick} />}
+
+        <div ref={resultsRef} className="space-y-6">
           {results.map((r) => (
             <div key={r.symbol} className="bg-gray-800 p-6 rounded-lg shadow-lg">
               

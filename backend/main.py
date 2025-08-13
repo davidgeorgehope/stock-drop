@@ -1,6 +1,8 @@
-from datetime import datetime, timezone, date
+from datetime import datetime, timezone, date, timedelta, time as dtime
 import os
 from typing import List, Optional, Union
+import asyncio
+import threading
 
 from fastapi import FastAPI, HTTPException, Query, Request, Response
 from fastapi.middleware.cors import CORSMiddleware
@@ -14,6 +16,119 @@ import csv
 from io import StringIO, BytesIO
 from hashlib import md5
 from PIL import Image, ImageDraw, ImageFont
+from zoneinfo import ZoneInfo
+import textwrap
+
+
+def _rank_interesting_losers(candidates: List["LoserStock"], top_n: int = 10) -> List["InterestingLoser"]:
+    """Use LLM + lightweight headline search to rank losers by 'newsworthiness'."""
+    if not candidates:
+        return []
+    # Fetch minimal headlines for each candidate (cap to avoid rate limiting)
+    enriched: List[tuple["LoserStock", List["SourceItem"]]] = []
+    for c in candidates[: min(60, len(candidates))]:
+        try:
+            news = _search_news_for_symbol(c.symbol, days=3, max_results=4)
+        except Exception:
+            news = []
+        enriched.append((c, news))
+    # Build LLM prompt summarizing each candidate
+    lines: List[str] = []
+    for stock, news in enriched:
+        snippet_titles = "; ".join([n.title for n in news[:3] if n.title])
+        chg = f"{stock.change_percent:.2f}%" if isinstance(stock.change_percent, (int, float)) else "n/a"
+        lines.append(f"{stock.symbol} ({chg}) — {snippet_titles}")
+    catalog = "\n".join(lines)
+    prompt = (
+        "You are a sharp markets editor. From the following decliners, pick the most newsworthy 10.\n"
+        "Prefer names with clear catalysts (earnings, guidance, downgrades, litigation, macro, product news) and broad interest.\n"
+        "Avoid microcaps and illiquid names unless there is major news.\n"
+        "Return a JSON array of objects with: symbol, reason (1 sentence).\n\n"
+        f"Candidates (symbol, today's % change, top headlines):\n{catalog}\n\n"
+        "Return strictly JSON."
+    )
+    try:
+        raw = _call_openai(prompt)
+        import json, re
+        m = re.search(r"\[.*\]", raw, re.DOTALL)
+        arr = json.loads(m.group(0) if m else raw)
+        picked: List[InterestingLoser] = []
+        sym_to_stock = {c.symbol: c for c, _ in enriched}
+        for item in arr:
+            if not isinstance(item, dict):
+                continue
+            sym = (item.get("symbol") or "").strip().upper()
+            if not sym or sym not in sym_to_stock:
+                continue
+            st = sym_to_stock[sym]
+            picked.append(InterestingLoser(**st.dict(), reason=item.get("reason")))
+        return picked[:top_n]
+    except Exception as e:
+        print(f"❌ LLM ranking failed: {e}")
+        return []
+
+
+def _get_interesting_losers(candidates: List["LoserStock"], top_n: int = 10) -> List["InterestingLoser"]:
+    global INTERESTING_LOSERS_CACHE
+    now = time.time()
+    with INTERESTING_LOSERS_LOCK:
+        if INTERESTING_LOSERS_CACHE and (now - INTERESTING_LOSERS_CACHE[0]) < INTERESTING_LOSERS_CACHE_TTL_SECONDS:
+            return INTERESTING_LOSERS_CACHE[1]
+    ranked = _rank_interesting_losers(candidates, top_n)
+    with INTERESTING_LOSERS_LOCK:
+        INTERESTING_LOSERS_CACHE = (time.time(), ranked)
+    return ranked
+
+
+def _refresh_interesting_losers_cache():
+    """Refresh the interesting losers cache by computing EOD losers and ranking."""
+    try:
+        full = _fetch_biggest_losers_polygon_eod()
+        full.sort(key=lambda l: l.change_percent or 0)
+        # Stage 1: reduce to 30 via LLM without headlines
+        stage1 = full[:300]
+        try:
+            tick_lines = [f"{s.symbol} {s.change_percent:.2f}%" for s in stage1 if isinstance(s.change_percent, (int, float))]
+            prompt = (
+                "You are a markets editor. From this list of decliners, pick the 30 most likely to be newsworthy today.\n"
+                "Prefer recognizable names, earnings/guidance/catalyst windows, sector moves, litigation, macro.\n"
+                "Return a JSON array of symbols only.\n\n" + "\n".join(tick_lines)
+            )
+            raw = _call_openai(prompt)
+            import json, re
+            m = re.search(r"\[.*\]", raw, re.DOTALL)
+            arr = json.loads(m.group(0) if m else raw)
+            pickset = {str(x).strip().upper() for x in arr if isinstance(x, (str,))}
+            reduced = [s for s in stage1 if s.symbol in pickset][:30]
+        except Exception:
+            reduced = stage1[:30]
+        ranked = _rank_interesting_losers(reduced, 12)
+        global INTERESTING_LOSERS_CACHE
+        with INTERESTING_LOSERS_LOCK:
+            INTERESTING_LOSERS_CACHE = (time.time(), ranked)
+        print(f"🔄 Interesting losers cache refreshed with {len(ranked)} items")
+    except Exception as e:
+        print(f"❌ Failed to refresh interesting losers cache: {e}")
+
+from datetime import datetime, timezone, date, timedelta, time as dtime
+import os
+from typing import List, Optional, Union
+import asyncio
+import threading
+
+from fastapi import FastAPI, HTTPException, Query, Request, Response
+from fastapi.middleware.cors import CORSMiddleware
+from pydantic import BaseModel
+
+from openai import OpenAI
+from dotenv import load_dotenv
+import requests
+import time
+import csv
+from io import StringIO, BytesIO
+from hashlib import md5
+from PIL import Image, ImageDraw, ImageFont
+from zoneinfo import ZoneInfo
 import textwrap
 
 # Load env vars from a local .env if present (dev convenience)
@@ -44,6 +159,38 @@ app.add_middleware(
     allow_methods=["*"],
     allow_headers=["*"],
 )
+
+
+@app.on_event("startup")
+async def startup_event():
+    """Initialize application on startup."""
+    print("🚀 Application starting up...")
+    # Populate caches at startup in threads so FastAPI startup completes
+    def init_cache():
+        try:
+            _refresh_biggest_losers_cache()
+        except Exception as e:
+            print(f"Startup cache init failed: {e}")
+        try:
+            _refresh_interesting_losers_cache()
+        except Exception as e:
+            print(f"Startup interesting cache init failed: {e}")
+    threading.Thread(target=init_cache, daemon=True).start()
+
+    # Start daily/background refresh for both caches
+    def periodic_refresh():
+        while True:
+            time.sleep(INTERESTING_LOSERS_CACHE_TTL_SECONDS)
+            try:
+                _refresh_biggest_losers_cache()
+            except Exception as e:
+                print(f"Periodic refresh failed: {e}")
+            try:
+                _refresh_interesting_losers_cache()
+            except Exception as e:
+                print(f"Periodic interesting refresh failed: {e}")
+    threading.Thread(target=periodic_refresh, daemon=True).start()
+    print("✅ Startup initialization queued")
 
 
 class AnalyzeRequest(BaseModel):
@@ -95,7 +242,24 @@ def _ensure_list_symbols(input_symbols: Union[str, List[str]]) -> List[str]:
 
 
 def _search_news_for_symbol(symbol: str, days: int, max_results: int) -> List[SourceItem]:
-    # Query DuckDuckGo News; no Google fallback
+    # Query DuckDuckGo News with tiny on-disk cache to limit rate usage
+    try:
+        if NEWS_CACHE_DIR:
+            os.makedirs(NEWS_CACHE_DIR, exist_ok=True)
+            cache_key = f"{symbol.upper()}_{days}_{max_results}.json"
+            cache_path = os.path.join(NEWS_CACHE_DIR, cache_key)
+            if os.path.exists(cache_path):
+                try:
+                    mtime = os.path.getmtime(cache_path)
+                    if time.time() - mtime < NEWS_CACHE_TTL_SECONDS:
+                        import json as _json
+                        with open(cache_path, "r", encoding="utf-8") as f:
+                            cached = _json.load(f)
+                        return [SourceItem(**it) for it in cached]
+                except Exception:
+                    pass
+    except Exception:
+        pass
     try:
         # Import here to avoid hard dependency at module import time
         from duckduckgo_search import DDGS  # type: ignore
@@ -132,6 +296,17 @@ def _search_news_for_symbol(symbol: str, days: int, max_results: int) -> List[So
             time.sleep(0.8 * attempts)
 
     cleaned = [i for i in items if i.url]
+    # Save to cache
+    try:
+        if cleaned and NEWS_CACHE_DIR:
+            import json as _json
+            os.makedirs(NEWS_CACHE_DIR, exist_ok=True)
+            cache_key = f"{symbol.upper()}_{days}_{max_results}.json"
+            cache_path = os.path.join(NEWS_CACHE_DIR, cache_key)
+            with open(cache_path, "w", encoding="utf-8") as f:
+                _json.dump([c.dict() for c in cleaned], f)
+    except Exception:
+        pass
     return cleaned
 
 
@@ -216,20 +391,102 @@ class ChartResponse(BaseModel):
     volumes: List[Optional[int]]
 
 
+class LoserStock(BaseModel):
+    symbol: str
+    name: Optional[str] = None
+    price: Optional[float] = None
+    change: Optional[float] = None
+    change_percent: Optional[float] = None
+    volume: Optional[int] = None
+
+
+class BiggestLosersResponse(BaseModel):
+    losers: List[LoserStock]
+    last_updated: str
+    session: str | None = None
+
+
+class InterestingLoser(LoserStock):
+    reason: Optional[str] = None
+
+
+class InterestingLosersResponse(BaseModel):
+    losers: List[InterestingLoser]
+    last_updated: str
+    session: str | None = None
+
+
 QUOTE_CACHE_TTL_SECONDS = int(os.getenv("QUOTE_CACHE_TTL_SECONDS", "60"))
 QUOTE_CACHE: dict[str, tuple[float, QuoteResponse]] = {}
 
 
+def _fetch_daily_history_prefer_stooq(symbol: str) -> List[dict]:
+    """Return recent daily history rows, preferring Stooq; fallback to Polygon aggs.
+
+    Row shape: {date, date_iso, open, high, low, close, volume}
+    """
+    stooq = _fetch_stooq_history(symbol)
+    if stooq:
+        return stooq
+    # Fallback to cached EOD series built from grouped data (2-point series)
+    if symbol in EOD_SERIES_CACHE:
+        return EOD_SERIES_CACHE.get(symbol) or []
+    # If allowed, try Polygon daily aggs (may not be available on free tier)
+    api_key = os.getenv("POLYGON_API_KEY")
+    if not api_key:
+        return []
+    try:
+        # Compute date range (UTC)
+        end = datetime.now(timezone.utc).date()
+        start = end - timedelta(days=90)
+        url = (
+            f"https://api.polygon.io/v2/aggs/ticker/{symbol}/range/1/day/{start.isoformat()}/{end.isoformat()}"
+            f"?adjusted=true&sort=asc&limit=200&apiKey={api_key}"
+        )
+        resp = requests.get(url, timeout=15)
+        if resp.status_code != 200:
+            snippet = (resp.text or "").strip().replace("\n", " ")[:180]
+            print(f"⚠️ Polygon aggs fallback failed for {symbol}: HTTP {resp.status_code} — {snippet}")
+            return []
+        data = resp.json() or {}
+        results = data.get("results") or []
+        rows: List[dict] = []
+        for r in results:
+            try:
+                # Polygon 't' is ms since epoch UTC
+                ts_ms = int(r.get("t"))
+                dt_utc = datetime.fromtimestamp(ts_ms / 1000, tz=timezone.utc)
+                rows.append(
+                    {
+                        "date": dt_utc.strftime("%Y-%m-%d"),
+                        "date_iso": dt_utc.isoformat(),
+                        "open": _safe_float(r.get("o")),
+                        "high": _safe_float(r.get("h")),
+                        "low": _safe_float(r.get("l")),
+                        "close": _safe_float(r.get("c")),
+                        "volume": _safe_int(r.get("v")),
+                    }
+                )
+            except Exception:
+                continue
+        rows = [r for r in rows if r.get("close") is not None]
+        rows = rows[-30:] if len(rows) > 30 else rows
+        return rows
+    except Exception as e:
+        print(f"⚠️ Polygon aggs exception for {symbol}: {e}")
+        return []
+
+
 def _fetch_yahoo_quote(symbol: str) -> QuoteResponse:
-    # Simplified: Use Stooq as the sole data source
+    # Prefer Stooq; fallback to Polygon daily aggs
     now = time.time()
     cached = QUOTE_CACHE.get(symbol)
     if cached and (now - cached[0]) < QUOTE_CACHE_TTL_SECONDS:
         return cached[1]
-    stooq = _fetch_stooq_history(symbol)
-    if stooq:
-        last = stooq[-1]
-        prev = stooq[-2] if len(stooq) > 1 else None
+    hist = _fetch_daily_history_prefer_stooq(symbol)
+    if hist:
+        last = hist[-1]
+        prev = hist[-2] if len(hist) > 1 else None
         price = _safe_float(last.get("close"))
         change = None
         change_pct = None
@@ -265,19 +522,19 @@ def _fetch_yahoo_chart(symbol: str, range_: str, interval: str) -> ChartResponse
     cached = CHART_CACHE.get(cache_key)
     if cached and (now - cached[0]) < CHART_CACHE_TTL_SECONDS:
         return cached[1]
-    stooq = _fetch_stooq_history(symbol)
-    if stooq:
-        ts = [int(datetime.strptime(r["date"], "%Y-%m-%d").replace(tzinfo=timezone.utc).timestamp()) for r in stooq]
+    hist = _fetch_daily_history_prefer_stooq(symbol)
+    if hist:
+        ts = [int(datetime.strptime(r["date"], "%Y-%m-%d").replace(tzinfo=timezone.utc).timestamp()) for r in hist]
         response = ChartResponse(
             symbol=symbol,
             range=range_,
             interval=interval,
             timestamps=ts,
-            opens=[_safe_float(r.get("open")) for r in stooq],
-            highs=[_safe_float(r.get("high")) for r in stooq],
-            lows=[_safe_float(r.get("low")) for r in stooq],
-            closes=[_safe_float(r.get("close")) for r in stooq],
-            volumes=[_safe_int(r.get("volume")) for r in stooq],
+            opens=[_safe_float(r.get("open")) for r in hist],
+            highs=[_safe_float(r.get("high")) for r in hist],
+            lows=[_safe_float(r.get("low")) for r in hist],
+            closes=[_safe_float(r.get("close")) for r in hist],
+            volumes=[_safe_int(r.get("volume")) for r in hist],
         )
         CHART_CACHE[cache_key] = (now, response)
         return response
@@ -371,6 +628,55 @@ def _fetch_stooq_history(symbol: str) -> List[dict]:
     return []
 
 
+## Removed legacy popular symbols list
+
+
+## Removed legacy losers-from-news search flow
+
+
+## Removed legacy losers extraction from news
+
+
+## Removed legacy biggest losers sync fetcher
+
+
+def _refresh_biggest_losers_cache():
+    # Retained for compatibility; now a thin wrapper around interesting cache warm.
+    try:
+        _refresh_interesting_losers_cache()
+    except Exception as e:
+        print(f"❌ Failed to run interesting losers warm: {e}")
+
+
+def _background_refresh_loop():
+    # Legacy loop retained but now delegates to interesting cache refresh
+    while True:
+        try:
+            time.sleep(INTERESTING_LOSERS_CACHE_TTL_SECONDS)
+            _refresh_interesting_losers_cache()
+        except Exception as e:
+            print(f"❌ Background refresh error: {e}")
+            time.sleep(300)
+
+
+def _ensure_cache_initialized():
+    """Initialize curated losers cache once in the background."""
+    global _background_refresh_task, _app_started
+    if _app_started:
+        return
+    threading.Thread(target=_refresh_interesting_losers_cache, daemon=True).start()
+    if _background_refresh_task is None:
+        _background_refresh_task = threading.Thread(target=_background_refresh_loop, daemon=True)
+        _background_refresh_task.start()
+    _app_started = True
+
+
+def _get_cached_biggest_losers() -> List[LoserStock]:
+    """Deprecated: always return empty; use /interesting-losers for data."""
+    _ensure_cache_initialized()
+    return []
+
+
 def _get_price_context(symbol: str) -> Optional[str]:
     quote = _fetch_yahoo_quote(symbol)
     chart = _fetch_yahoo_chart(symbol, range_="1mo", interval="1d")
@@ -404,6 +710,178 @@ def _sanitize_symbol(symbol: str) -> str:
 OG_IMAGE_CACHE_TTL_SECONDS = int(os.getenv("OG_IMAGE_CACHE_TTL_SECONDS", "1800"))
 OG_IMAGE_CACHE: dict[str, tuple[float, bytes]] = {}
 
+# Background refresh state
+_background_refresh_task = None
+_app_started = False
+
+# Cache for interesting losers (LLM-ranked)
+INTERESTING_LOSERS_CACHE_TTL_SECONDS = int(os.getenv("INTERESTING_LOSERS_CACHE_TTL_SECONDS", "86400"))
+INTERESTING_LOSERS_CACHE: Optional[tuple[float, List[InterestingLoser]]] = None
+INTERESTING_LOSERS_LOCK = threading.RLock()
+
+# Optional on-disk cache for news lookups to reduce DDG usage across restarts
+NEWS_CACHE_DIR = os.getenv("NEWS_CACHE_DIR") or os.path.join(os.path.dirname(__file__), ".cache", "news")
+NEWS_CACHE_TTL_SECONDS = int(os.getenv("NEWS_CACHE_TTL_SECONDS", "604800"))  # 7 days
+
+# In-memory EOD series cache built from grouped results (prev + target dates)
+EOD_SERIES_CACHE: dict[str, list[dict]] = {}
+
+
+def _fetch_biggest_losers_polygon() -> List[LoserStock]:
+    """Fetch biggest losers using Polygon.io Full Market Snapshot.
+    
+    Requires env var POLYGON_API_KEY. Returns up to 50 losers sorted by most negative %.
+    """
+    api_key = os.getenv("POLYGON_API_KEY")
+    if not api_key:
+        print("❌ Polygon API key not set. Please set POLYGON_API_KEY in environment or .env")
+        return []
+    url = (
+        f"https://api.polygon.io/v2/snapshot/locale/us/markets/stocks/tickers?apiKey={api_key}"
+    )
+    try:
+        resp = requests.get(url, timeout=20)
+        if resp.status_code != 200:
+            body = None
+            try:
+                body = resp.text
+            except Exception:
+                body = None
+            snippet = (body or "").strip().replace("\n", " ")[:300]
+            print(f"❌ Polygon snapshot failed: HTTP {resp.status_code} — {snippet}")
+            return []
+        payload = resp.json() or {}
+        tickers = payload.get("tickers") or []
+        losers: List[LoserStock] = []
+        for t in tickers:
+            try:
+                symbol = (t.get("ticker") or "").strip().upper()
+                if not symbol:
+                    continue
+                last_trade = t.get("lastTrade") or {}
+                price = _safe_float(last_trade.get("p"))
+                if price is None:
+                    day_obj = t.get("day") or {}
+                    price = _safe_float(day_obj.get("c"))
+                change = _safe_float(t.get("todaysChange"))
+                change_pct = _safe_float(t.get("todaysChangePerc"))
+                day_obj = t.get("day") or {}
+                volume = _safe_int(day_obj.get("v"))
+                losers.append(
+                    LoserStock(
+                        symbol=symbol,
+                        name=None,
+                        price=price,
+                        change=change,
+                        change_percent=change_pct,
+                        volume=volume,
+                    )
+                )
+            except Exception:
+                continue
+        losers = [l for l in losers if isinstance(l.change_percent, (int, float)) and l.change_percent < 0]
+        losers.sort(key=lambda l: l.change_percent)
+        return losers[:50]
+    except Exception as e:
+        print(f"❌ Polygon snapshot exception: {e}")
+        return []
+
+
+def _is_business_day(d: date) -> bool:
+    return d.weekday() < 5
+
+
+def _prev_business_day(d: date) -> date:
+    cur = d - timedelta(days=1)
+    while not _is_business_day(cur):
+        cur -= timedelta(days=1)
+    return cur
+
+
+def _determine_eod_target_date(now_utc: Optional[datetime] = None) -> date:
+    """Return strictly the previous business day in America/New_York.
+
+    This avoids 403s on free plans that cannot access today's grouped data
+    until after end of day processing is complete.
+    """
+    if now_utc is None:
+        now_utc = datetime.now(timezone.utc)
+    ny = now_utc.astimezone(ZoneInfo("America/New_York"))
+    return _prev_business_day(ny.date())
+
+
+def _fetch_polygon_grouped(date_str: str) -> list:
+    api_key = os.getenv("POLYGON_API_KEY")
+    if not api_key:
+        print("❌ Polygon API key not set. Please set POLYGON_API_KEY in environment or .env")
+        return []
+    url = f"https://api.polygon.io/v2/aggs/grouped/locale/us/market/stocks/{date_str}?adjusted=true&apiKey={api_key}"
+    try:
+        resp = requests.get(url, timeout=30)
+        if resp.status_code != 200:
+            snippet = (resp.text or "").strip().replace("\n", " ")[:300]
+            print(f"❌ Polygon grouped failed for {date_str}: HTTP {resp.status_code} — {snippet}")
+            return []
+        payload = resp.json() or {}
+        return payload.get("results") or []
+    except Exception as e:
+        print(f"❌ Polygon grouped exception for {date_str}: {e}")
+        return []
+
+
+def _fetch_biggest_losers_polygon_eod() -> List[LoserStock]:
+    """Compute biggest losers from Polygon grouped EOD for the latest trading day."""
+    target = _determine_eod_target_date()
+    prev = _prev_business_day(target)
+    target_str = target.isoformat()
+    prev_str = prev.isoformat()
+    print(f"ℹ️ Computing EOD losers for {target_str} (prev {prev_str})")
+    today_group = _fetch_polygon_grouped(target_str)
+    prev_group = _fetch_polygon_grouped(prev_str)
+    if not today_group or not prev_group:
+        print("⚠️ Missing grouped data for one or both days; returning empty losers list")
+        return []
+    prev_close_by_ticker: dict[str, float] = {}
+    for r in prev_group:
+        try:
+            tkr = (r.get("T") or "").strip().upper()
+            c_prev = _safe_float(r.get("c"))
+            if tkr and c_prev is not None and c_prev > 0:
+                prev_close_by_ticker[tkr] = c_prev
+        except Exception:
+            continue
+    losers: List[LoserStock] = []
+    for r in today_group:
+        try:
+            tkr = (r.get("T") or "").strip().upper()
+            if not tkr or not tkr.isalpha() or len(tkr) > 5:
+                continue
+            c_today = _safe_float(r.get("c"))
+            v_today = _safe_int(r.get("v"))
+            c_prev = prev_close_by_ticker.get(tkr)
+            if c_today is None or c_prev is None or c_prev <= 0:
+                continue
+            change = c_today - c_prev
+            change_pct = (change / c_prev) * 100.0
+            if change_pct < 0:
+                losers.append(
+                    LoserStock(
+                        symbol=tkr,
+                        name=None,
+                        price=c_today,
+                        change=change,
+                        change_percent=change_pct,
+                        volume=v_today,
+                    )
+                )
+        except Exception:
+            continue
+    # Keep broad universe here; filtering may be applied by callers when needed
+    losers.sort(key=lambda l: l.change_percent or 0)
+    return losers[:50]
+
+
+## Removed S&P/NASDAQ universe filtering to avoid redundancy per product direction
 
 def _generate_og_image_png(symbol: str) -> bytes:
     # Match the actual site's look - dark background, detailed commentary
@@ -523,6 +1001,8 @@ def _generate_og_image_png(symbol: str) -> bytes:
         # High/Low labels like site
         draw.text((chart_right - 100, chart_top - 25), f"High: ${max_close:.2f}", font=tiny_font, fill=gray)
         draw.text((chart_right - 100, chart_bottom + 5), f"Low: ${min_close:.2f}", font=tiny_font, fill=gray)
+    else:
+        print(f"⚠️ OG chart missing series for {symbol}; history points: {len(closes)}")
     
     # Commentary - get actual analysis like the site shows
     def _get_full_commentary() -> str:
@@ -651,6 +1131,34 @@ async def get_chart(
     if not symbol:
         raise HTTPException(status_code=400, detail="Symbol is required")
     return _fetch_yahoo_chart(symbol, range, interval)
+
+
+## Removed legacy /biggest-losers endpoint in favor of /interesting-losers
+
+
+@app.get("/interesting-losers", response_model=InterestingLosersResponse)
+async def get_interesting_losers(
+    candidates: int = Query(200, ge=20, le=1000),
+    top: int = Query(12, ge=5, le=25),
+) -> InterestingLosersResponse:
+    """Return curated losers from cache only; never compute in request path.
+
+    If cache is empty/not warmed yet, returns an empty list immediately.
+    """
+    with INTERESTING_LOSERS_LOCK:
+        cached = INTERESTING_LOSERS_CACHE
+    if cached and (time.time() - cached[0]) < INTERESTING_LOSERS_CACHE_TTL_SECONDS:
+        ranked = cached[1][:top]
+        ts = cached[0]
+    else:
+        ranked = []
+        ts = time.time()
+    return InterestingLosersResponse(
+        losers=ranked,
+        last_updated=datetime.fromtimestamp(ts, tz=timezone.utc).isoformat(),
+        session="EOD",
+    )
+
 
 
 @app.get("/og-image/{symbol}.png")
