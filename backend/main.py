@@ -40,7 +40,7 @@ def _rank_interesting_losers(candidates: List["LoserStock"], top_n: int = 10) ->
         lines.append(f"{stock.symbol} ({chg}) — {snippet_titles}")
     catalog = "\n".join(lines)
     prompt = (
-        "You are a sharp markets editor. From the following decliners, pick the most newsworthy 10.\n"
+        f"You are a sharp markets editor. From the following decliners, pick the most newsworthy {top_n}.\n"
         "Prefer names with clear catalysts (earnings, guidance, downgrades, litigation, macro, product news) and broad interest.\n"
         "Avoid microcaps and illiquid names unless there is major news.\n"
         "Return a JSON array of objects with: symbol, reason (1 sentence).\n\n"
@@ -105,7 +105,7 @@ def _refresh_interesting_losers_cache():
         ranked = _rank_interesting_losers(reduced, 15)
         # Final Stooq reconciliation: downrank mismatches instead of dropping
         try:
-            tol_pp = float(os.getenv("LOSERS_FINAL_STOOQ_TOLERANCE_PPTS", "25.0"))
+            tol_pp = float(os.getenv("LOSERS_FINAL_STOOQ_TOLERANCE_PPTS", "10.0"))
             enabled = os.getenv("LOSERS_FINAL_STOOQ_CHECK", "1") not in {"0", "false", "False"}
             if enabled:
                 ranked = _filter_ranked_losers_by_stooq(ranked, tol_pp)
@@ -661,16 +661,43 @@ def _filter_ranked_losers_by_stooq(
 ) -> List["InterestingLoser"]:
     """Downrank items whose Polygon EOD % differs materially from Stooq.
 
-    Instead of removing items, apply a simple penalty and re-order so that
+    Instead of removing items, apply a penalty and re-order so that
     mismatches fall toward the bottom while keeping the list length intact.
 
-    Penalties (lower is better):
-      - 0: within tolerance or missing Stooq data
-      - 1: absolute difference > tolerance_pp
-      - 2: signs differ and at least one magnitude >= min_abs_for_sign_check
+    Penalties are calculated based on:
+      - Base: 0 for within tolerance
+      - No Stooq data: If move > threshold (default 30%), penalty = 15
+      - Stepwise: +1 for each step_pp (default 2%) over tolerance
+      - Sign bonus: Additional penalty (default +10) for sign mismatches
+      - Max penalty: Capped at max_penalty (default 50)
+    
+    Note: When Stooq data is unavailable (e.g., rate limited), extreme
+    moves are penalized to prevent unverifiable outliers from ranking high.
     """
     if not ranked:
         return ranked
+
+    # Tunables via env
+    try:
+        step_pp = float(os.getenv("LOSERS_STOOQ_PENALTY_STEP_PPTS", "2.0"))
+    except Exception:
+        step_pp = 2.0
+    try:
+        sign_bonus = int(os.getenv("LOSERS_STOOQ_PENALTY_SIGN_BONUS", "10"))
+    except Exception:
+        sign_bonus = 10
+    try:
+        max_penalty = int(os.getenv("LOSERS_STOOQ_MAX_PENALTY", "50"))
+    except Exception:
+        max_penalty = 50
+    try:
+        no_data_extreme_threshold = float(os.getenv("LOSERS_STOOQ_NO_DATA_EXTREME_THRESHOLD", "20.0"))
+    except Exception:
+        no_data_extreme_threshold = 20.0
+    try:
+        no_data_extreme_penalty = int(os.getenv("LOSERS_STOOQ_NO_DATA_EXTREME_PENALTY", "30"))
+    except Exception:
+        no_data_extreme_penalty = 30
 
     scored: List[tuple[int, int, InterestingLoser]] = []
     for idx, item in enumerate(ranked):
@@ -678,15 +705,27 @@ def _filter_ranked_losers_by_stooq(
         try:
             stooq_pct = _stooq_day_change_percent(item.symbol)
             poly_pct = item.change_percent
-            if stooq_pct is None or poly_pct is None:
+            if poly_pct is None:
                 penalty = 0
+            elif stooq_pct is None:
+                # No Stooq data available - treat extreme moves as suspicious
+                if poly_pct is not None and abs(poly_pct) > no_data_extreme_threshold:
+                    penalty = no_data_extreme_penalty
+                else:
+                    penalty = 0
             else:
                 diff_pp = abs(poly_pct - stooq_pct)
                 signs_differ = (poly_pct < 0) != (stooq_pct < 0)
+                # Base stepwise penalty once over tolerance
+                if diff_pp > tolerance_pp and step_pp > 0:
+                    overflow = diff_pp - tolerance_pp
+                    penalty = int(overflow // step_pp) + 1
+                # Extra penalty for meaningful sign mismatches
                 if signs_differ and max(abs(poly_pct), abs(stooq_pct)) >= min_abs_for_sign_check:
-                    penalty = 2
-                elif diff_pp > tolerance_pp:
-                    penalty = 1
+                    penalty += max(sign_bonus, 1)
+                # Cap to keep sort keys bounded
+                if penalty > max_penalty:
+                    penalty = max_penalty
         except Exception:
             penalty = 0
         scored.append((penalty, idx, item))
@@ -1047,15 +1086,28 @@ def _generate_og_image_png(symbol: str) -> bytes:
         chg = quote.change or 0.0
         chg_pct = quote.change_percent or 0.0
         price_color = red if chg < 0 else green
-        price_text = f"${quote.price:.2f}  {chg:+.2f} ({chg_pct:+.2f}%)"
+        price_text = f"${quote.price:.2f}  1d {chg:+.2f} ({chg_pct:+.2f}%)"
         # Measure text to position it right-aligned
         bbox = draw.textbbox((0, 0), _clean_text(price_text), font=med_font)
         price_width = bbox[2] - bbox[0]
-        draw.text((width - padding - price_width, y + 5), _clean_text(price_text), font=med_font, fill=price_color)
+        right_x = width - padding
+        draw.text((right_x - price_width, y + 5), _clean_text(price_text), font=med_font, fill=price_color)
+        # Second line: 1-month change to match the chart range
+        try:
+            if len(closes) >= 2 and closes[0] not in (None, 0):
+                m1_pct = ((closes[-1] - closes[0]) / closes[0]) * 100.0
+                m1_text = f"1mo {m1_pct:+.2f}%"
+                m1_color = red if m1_pct < 0 else green
+                m1_bbox = draw.textbbox((0, 0), _clean_text(m1_text), font=small_font)
+                m1_width = m1_bbox[2] - m1_bbox[0]
+                # Slightly larger offset so it doesn't crowd the top labels
+                draw.text((right_x - m1_width, y + 5 + 48), _clean_text(m1_text), font=small_font, fill=m1_color)
+        except Exception:
+            pass
     
     # Chart area - compact, top right
-    # Move chart down a touch to make room for the larger title/price row
-    chart_y = y + 80
+    # Move chart down to avoid overlapping with the top-right price lines
+    chart_y = y + 130
     chart_height = 180
     chart_width = 400
     chart_left = width - padding - chart_width
@@ -1080,7 +1132,8 @@ def _generate_og_image_png(symbol: str) -> bytes:
         line_color = red if closes[-1] < closes[0] else green
         draw.line(points, fill=line_color, width=3)
         
-        # High/Low labels like site
+        # Range label and High/Low labels like site
+        draw.text((chart_right - 100, chart_top - 45), "Range: 1mo", font=tiny_font, fill=gray)
         draw.text((chart_right - 100, chart_top - 25), f"High: ${max_close:.2f}", font=tiny_font, fill=gray)
         draw.text((chart_right - 100, chart_bottom + 5), f"Low: ${min_close:.2f}", font=tiny_font, fill=gray)
     else:
