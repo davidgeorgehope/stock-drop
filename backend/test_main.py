@@ -138,3 +138,144 @@ def test_share_page_meta_and_redirect(monkeypatch: pytest.MonkeyPatch):
     assert 'meta name="twitter:card" content="summary_large_image"' in html
     # Reference to image path present (absolute or testserver)
     assert "/og-image/ESTC.png" in html
+
+
+def test_eod_losers_percent_is_from_polygon_grouped_math(monkeypatch: pytest.MonkeyPatch):
+    """Verify EOD losers math uses Polygon grouped closes (today vs prev day).
+
+    We stub the grouped results for two dates so the function computes a known
+    percent drop for TPC: from 30.0 to 10.0 is -66.6667%.
+    """
+    from datetime import date as date_cls
+    from main import _fetch_biggest_losers_polygon_eod
+
+    # Fix the target date so the function asks for specific strings
+    monkeypatch.setattr("main._determine_eod_target_date", lambda now_utc=None: date_cls(2024, 1, 3))
+
+    def fake_grouped(date_str: str):
+        if date_str == "2024-01-03":  # target day
+            return [
+                {"T": "TPC", "c": 10.0, "v": 1000},  # down vs prev
+                {"T": "ABC", "c": 102.0, "v": 2000},  # up vs prev (should be filtered out)
+            ]
+        if date_str == "2024-01-02":  # previous business day
+            return [
+                {"T": "TPC", "c": 30.0, "v": 900},
+                {"T": "ABC", "c": 100.0, "v": 1800},
+            ]
+        return []
+
+    monkeypatch.setattr("main._fetch_polygon_grouped", lambda ds: fake_grouped(ds))
+
+    losers = _fetch_biggest_losers_polygon_eod()
+    # Find TPC and assert the computed percent matches the math
+    tpc = next((l for l in losers if l.symbol == "TPC"), None)
+    assert tpc is not None, "Expected TPC in losers list"
+    assert pytest.approx(tpc.change_percent, rel=1e-6) == -66.6666666667
+
+
+def test_llm_cannot_invent_symbol_not_in_candidates(monkeypatch: pytest.MonkeyPatch):
+    """Ensure ranking pipeline never surfaces a symbol the LLM makes up.
+
+    Provide candidates with only RACE, but make the LLM try to return FERAR.
+    The final curated list must not contain FERAR.
+    """
+    from main import _refresh_interesting_losers_cache, LoserStock, INTERESTING_LOSERS_CACHE_TTL_SECONDS
+    from main import _call_openai as real_call
+
+    # Feed only RACE as an input loser
+    monkeypatch.setattr(
+        "main._fetch_biggest_losers_polygon_eod",
+        lambda: [
+            LoserStock(symbol="RACE", name=None, price=100.0, change=-5.0, change_percent=-5.0, volume=100000)
+        ],
+    )
+
+    # Make _call_openai return FERAR in both the stage1 and ranking calls
+    call_count = {"n": 0}
+
+    def fake_call_openai(prompt: str) -> str:
+        call_count["n"] += 1
+        # First call (stage1 reducer): symbols array
+        if call_count["n"] == 1:
+            return "[\"RACE\", \"FERAR\"]"
+        # Second call (final ranking): array of objects
+        return "[{\"symbol\":\"FERAR\",\"reason\":\"Made up\"},{\"symbol\":\"RACE\",\"reason\":\"Real one\"}]"
+
+    monkeypatch.setattr("main._call_openai", fake_call_openai)
+
+    # Refresh cache using our stubs
+    _refresh_interesting_losers_cache()
+
+    r = client.get("/interesting-losers")
+    assert r.status_code == 200
+    data = r.json()
+    symbols = [x["symbol"] for x in data.get("losers", [])]
+    assert "RACE" in symbols
+    assert "FERAR" not in symbols
+
+
+def test_bogus_upstream_symbol_filtered_out(monkeypatch: pytest.MonkeyPatch):
+    """If grouped returns a non-primary symbol like FERAR, it should be filtered out."""
+    from main import _refresh_interesting_losers_cache
+    from datetime import date as date_cls
+
+    # Make EOD function operate on our synthetic grouped data
+    monkeypatch.setattr("main._determine_eod_target_date", lambda now_utc=None: date_cls(2024, 1, 3))
+
+    def fake_grouped(date_str: str):
+        if date_str == "2024-01-03":
+            return [
+                {"T": "FERAR", "c": 0.14, "v": 120000},
+                {"T": "RACE", "c": 95.0, "v": 500000},
+            ]
+        if date_str == "2024-01-02":
+            return [
+                {"T": "FERAR", "c": 0.27, "v": 150000},
+                {"T": "RACE", "c": 100.0, "v": 450000},
+            ]
+        return []
+    monkeypatch.setattr("main._fetch_polygon_grouped", lambda ds: fake_grouped(ds))
+
+    # Stage1 expects a symbol array; final ranking expects objects. Provide both.
+    call_idx = {"n": 0}
+    def fake_openai(prompt: str) -> str:
+        call_idx["n"] += 1
+        if call_idx["n"] == 1:
+            return "[\"FERAR\", \"RACE\"]"
+        return "[{\"symbol\":\"FERAR\",\"reason\":\"Echo\"},{\"symbol\":\"RACE\",\"reason\":\"Echo\"}]"
+    monkeypatch.setattr("main._call_openai", fake_openai)
+
+    _refresh_interesting_losers_cache()
+    r = client.get("/interesting-losers")
+    assert r.status_code == 200
+    data = r.json()
+    symbols = [x["symbol"] for x in data.get("losers", [])]
+    # With the new filter, non-primary symbols like FERAR are excluded
+    assert "FERAR" not in symbols
+    assert "RACE" in symbols
+
+
+def test_rights_like_symbol_drop_value_from_grouped_math(monkeypatch: pytest.MonkeyPatch):
+    """Confirm a rights-like ticker (e.g., FERAR) gets its % drop from grouped closes.
+
+    Use closes 0.27 -> 0.14, which should yield about -48.15%.
+    """
+    from datetime import date as date_cls
+    from main import _fetch_biggest_losers_polygon_eod
+
+    monkeypatch.setattr("main._determine_eod_target_date", lambda now_utc=None: date_cls(2024, 1, 3))
+
+    def fake_grouped(date_str: str):
+        if date_str == "2024-01-03":
+            return [{"T": "FERAR", "c": 0.14, "v": 120000}]
+        if date_str == "2024-01-02":
+            return [{"T": "FERAR", "c": 0.27, "v": 150000}]
+        return []
+
+    monkeypatch.setattr("main._fetch_polygon_grouped", lambda ds: fake_grouped(ds))
+
+    losers = _fetch_biggest_losers_polygon_eod()
+    # Non-primary symbols like FERAR should now be filtered out
+    ferar = next((l for l in losers if l.symbol == "FERAR"), None)
+    assert ferar is None

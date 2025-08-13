@@ -102,7 +102,16 @@ def _refresh_interesting_losers_cache():
             reduced = [s for s in stage1 if s.symbol in pickset][:30]
         except Exception:
             reduced = stage1[:30]
-        ranked = _rank_interesting_losers(reduced, 12)
+        ranked = _rank_interesting_losers(reduced, 15)
+        # Final Stooq sanity check to weed out extreme mismatches (e.g., -66% vs -1%)
+        try:
+            tol_pp = float(os.getenv("LOSERS_FINAL_STOOQ_TOLERANCE_PPTS", "25.0"))
+            enabled = os.getenv("LOSERS_FINAL_STOOQ_CHECK", "1") not in {"0", "false", "False"}
+            if enabled:
+                ranked = _filter_ranked_losers_by_stooq(ranked, tol_pp)
+        except Exception:
+            pass
+        ranked = ranked[:12]
         global INTERESTING_LOSERS_CACHE
         with INTERESTING_LOSERS_LOCK:
             INTERESTING_LOSERS_CACHE = (time.time(), ranked)
@@ -628,6 +637,56 @@ def _fetch_stooq_history(symbol: str) -> List[dict]:
     return []
 
 
+def _stooq_day_change_percent(symbol: str) -> Optional[float]:
+    """Return 1-day percent change from Stooq using the last two closes.
+
+    Returns None if unavailable.
+    """
+    try:
+        history = _fetch_stooq_history(symbol)
+        if not history or len(history) < 2:
+            return None
+        last_close = _safe_float(history[-1].get("close"))
+        prev_close = _safe_float(history[-2].get("close"))
+        if last_close is None or prev_close is None or prev_close <= 0:
+            return None
+        return ((last_close - prev_close) / prev_close) * 100.0
+    except Exception:
+        return None
+
+
+def _filter_ranked_losers_by_stooq(
+    ranked: List["InterestingLoser"],
+    tolerance_pp: float,
+    min_abs_for_sign_check: float = 5.0,
+) -> List["InterestingLoser"]:
+    """Final sanity filter comparing Polygon EOD change to Stooq day-over-day.
+
+    - Drop if absolute difference in percentage points exceeds tolerance_pp.
+    - Drop if signs differ and at least one magnitude is >= min_abs_for_sign_check.
+    """
+    if not ranked:
+        return ranked
+    filtered: List[InterestingLoser] = []
+    for item in ranked:
+        try:
+            stooq_pct = _stooq_day_change_percent(item.symbol)
+            poly_pct = item.change_percent
+            if stooq_pct is None or poly_pct is None:
+                filtered.append(item)
+                continue
+            diff_pp = abs(poly_pct - stooq_pct)
+            signs_differ = (poly_pct < 0) != (stooq_pct < 0)
+            if signs_differ and max(abs(poly_pct), abs(stooq_pct)) >= min_abs_for_sign_check:
+                # Likely mismatch due to corporate action or bad data
+                continue
+            if diff_pp > tolerance_pp:
+                continue
+            filtered.append(item)
+        except Exception:
+            filtered.append(item)
+    return filtered
+
 ## Removed legacy popular symbols list
 
 
@@ -705,6 +764,18 @@ def _sanitize_symbol(symbol: str) -> str:
     allowed = "ABCDEFGHIJKLMNOPQRSTUVWXYZ0123456789.-"
     s = "".join(ch for ch in s if ch in allowed)
     return s
+
+
+def _is_non_primary_equity_symbol(symbol: str) -> bool:
+    """Return True for NASDAQ-style fifth-letter suffixes that are not common
+    primary equity shares, such as Rights (R), Warrants (W), and Units (U),
+    and when-issued (V). This helps avoid confusing instruments like FERAR
+    (rights) with primary tickers such as RACE (Ferrari).
+    """
+    s = (symbol or "").strip().upper()
+    if len(s) == 5 and s[-1] in {"R", "W", "U", "V"}:
+        return True
+    return False
 
 
 OG_IMAGE_CACHE_TTL_SECONDS = int(os.getenv("OG_IMAGE_CACHE_TTL_SECONDS", "1800"))
@@ -855,6 +926,10 @@ def _fetch_biggest_losers_polygon_eod() -> List[LoserStock]:
         try:
             tkr = (r.get("T") or "").strip().upper()
             if not tkr or not tkr.isalpha() or len(tkr) > 5:
+                continue
+            # Filter out non-primary symbols like rights/warrants/units to
+            # avoid confusing tickers (e.g., FERAR) with primary equities.
+            if _is_non_primary_equity_symbol(tkr):
                 continue
             c_today = _safe_float(r.get("c"))
             v_today = _safe_int(r.get("v"))
