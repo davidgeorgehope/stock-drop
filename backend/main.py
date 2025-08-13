@@ -61,7 +61,7 @@ def _rank_interesting_losers(candidates: List["LoserStock"], top_n: int = 10) ->
             if not sym or sym not in sym_to_stock:
                 continue
             st = sym_to_stock[sym]
-            picked.append(InterestingLoser(**st.dict(), reason=item.get("reason")))
+            picked.append(InterestingLoser(**st.model_dump(), reason=item.get("reason")))
         return picked[:top_n]
     except Exception as e:
         print(f"❌ LLM ranking failed: {e}")
@@ -103,7 +103,7 @@ def _refresh_interesting_losers_cache():
         except Exception:
             reduced = stage1[:30]
         ranked = _rank_interesting_losers(reduced, 15)
-        # Final Stooq sanity check to weed out extreme mismatches (e.g., -66% vs -1%)
+        # Final Stooq reconciliation: downrank mismatches instead of dropping
         try:
             tol_pp = float(os.getenv("LOSERS_FINAL_STOOQ_TOLERANCE_PPTS", "25.0"))
             enabled = os.getenv("LOSERS_FINAL_STOOQ_CHECK", "1") not in {"0", "false", "False"}
@@ -111,7 +111,8 @@ def _refresh_interesting_losers_cache():
                 ranked = _filter_ranked_losers_by_stooq(ranked, tol_pp)
         except Exception:
             pass
-        ranked = ranked[:12]
+        # Keep the full ranked list (up to 15 from the ranking stage) in cache.
+        # The /interesting-losers endpoint will slice to the requested `top`.
         global INTERESTING_LOSERS_CACHE
         with INTERESTING_LOSERS_LOCK:
             INTERESTING_LOSERS_CACHE = (time.time(), ranked)
@@ -174,12 +175,13 @@ app.add_middleware(
 async def startup_event():
     """Initialize application on startup."""
     print("🚀 Application starting up...")
+    # Ensure this only runs once (avoids duplicate threads under reload/watchers)
+    global _app_started
+    if _app_started:
+        print("⚠️ Startup already initialized; skipping duplicate init")
+        return
     # Populate caches at startup in threads so FastAPI startup completes
     def init_cache():
-        try:
-            _refresh_biggest_losers_cache()
-        except Exception as e:
-            print(f"Startup cache init failed: {e}")
         try:
             _refresh_interesting_losers_cache()
         except Exception as e:
@@ -191,14 +193,11 @@ async def startup_event():
         while True:
             time.sleep(INTERESTING_LOSERS_CACHE_TTL_SECONDS)
             try:
-                _refresh_biggest_losers_cache()
-            except Exception as e:
-                print(f"Periodic refresh failed: {e}")
-            try:
                 _refresh_interesting_losers_cache()
             except Exception as e:
                 print(f"Periodic interesting refresh failed: {e}")
     threading.Thread(target=periodic_refresh, daemon=True).start()
+    _app_started = True
     print("✅ Startup initialization queued")
 
 
@@ -313,7 +312,7 @@ def _search_news_for_symbol(symbol: str, days: int, max_results: int) -> List[So
             cache_key = f"{symbol.upper()}_{days}_{max_results}.json"
             cache_path = os.path.join(NEWS_CACHE_DIR, cache_key)
             with open(cache_path, "w", encoding="utf-8") as f:
-                _json.dump([c.dict() for c in cleaned], f)
+                _json.dump([c.model_dump() for c in cleaned], f)
     except Exception:
         pass
     return cleaned
@@ -660,32 +659,40 @@ def _filter_ranked_losers_by_stooq(
     tolerance_pp: float,
     min_abs_for_sign_check: float = 5.0,
 ) -> List["InterestingLoser"]:
-    """Final sanity filter comparing Polygon EOD change to Stooq day-over-day.
+    """Downrank items whose Polygon EOD % differs materially from Stooq.
 
-    - Drop if absolute difference in percentage points exceeds tolerance_pp.
-    - Drop if signs differ and at least one magnitude is >= min_abs_for_sign_check.
+    Instead of removing items, apply a simple penalty and re-order so that
+    mismatches fall toward the bottom while keeping the list length intact.
+
+    Penalties (lower is better):
+      - 0: within tolerance or missing Stooq data
+      - 1: absolute difference > tolerance_pp
+      - 2: signs differ and at least one magnitude >= min_abs_for_sign_check
     """
     if not ranked:
         return ranked
-    filtered: List[InterestingLoser] = []
-    for item in ranked:
+
+    scored: List[tuple[int, int, InterestingLoser]] = []
+    for idx, item in enumerate(ranked):
+        penalty = 0
         try:
             stooq_pct = _stooq_day_change_percent(item.symbol)
             poly_pct = item.change_percent
             if stooq_pct is None or poly_pct is None:
-                filtered.append(item)
-                continue
-            diff_pp = abs(poly_pct - stooq_pct)
-            signs_differ = (poly_pct < 0) != (stooq_pct < 0)
-            if signs_differ and max(abs(poly_pct), abs(stooq_pct)) >= min_abs_for_sign_check:
-                # Likely mismatch due to corporate action or bad data
-                continue
-            if diff_pp > tolerance_pp:
-                continue
-            filtered.append(item)
+                penalty = 0
+            else:
+                diff_pp = abs(poly_pct - stooq_pct)
+                signs_differ = (poly_pct < 0) != (stooq_pct < 0)
+                if signs_differ and max(abs(poly_pct), abs(stooq_pct)) >= min_abs_for_sign_check:
+                    penalty = 2
+                elif diff_pp > tolerance_pp:
+                    penalty = 1
         except Exception:
-            filtered.append(item)
-    return filtered
+            penalty = 0
+        scored.append((penalty, idx, item))
+
+    scored.sort(key=lambda t: (t[0], t[1]))  # stable: lower penalty first, then original order
+    return [it for _, __, it in scored]
 
 ## Removed legacy popular symbols list
 

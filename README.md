@@ -62,7 +62,7 @@ Base URL is `http://localhost:8000` in dev (or `/api` in production behind Nginx
 
 - `GET /interesting-losers?candidates=300&top=12`
   - Response: `{ losers: [{ symbol, price?, change?, change_percent?, volume?, reason? }], last_updated, session }`
-  - Behavior: Returns a curated list ranked by an LLM from an EOD losers set computed from Polygon grouped data. Served from cache only; background refresh warms daily. If no Polygon key is set, will log and return an empty list until configured.
+  - Behavior: Returns a curated list ranked by an LLM from an EOD losers set computed from Polygon grouped data. Non‑primary symbols (rights/warrants/units with 5th‑letter suffix R/W/U/V) are excluded. After LLM ranking, a final sanity check compares Polygon EOD % change to Stooq’s day‑over‑day % change and drops large mismatches (tunable via env). Served from cache only; background refresh warms daily. If no Polygon key is set, will log and return an empty list until configured.
 
 - `GET /og-image/{symbol}.png`
   - Returns: PNG bytes with on‑brand OG preview (symbol, price/change, sparkline, succinct commentary). Cached in‑memory by ETag and TTL.
@@ -111,6 +111,8 @@ Base URL is `http://localhost:8000` in dev (or `/api` in production behind Nginx
 - `CHART_CACHE_TTL_SECONDS` (default: `300`)
 - `OG_IMAGE_CACHE_TTL_SECONDS` (default: `1800`)
 - `INTERESTING_LOSERS_CACHE_TTL_SECONDS` (default: `86400`)
+ - `LOSERS_FINAL_STOOQ_CHECK` (default: `1`) — enable/disable final Stooq sanity filter for `/interesting-losers`
+ - `LOSERS_FINAL_STOOQ_TOLERANCE_PPTS` (default: `25.0`) — max allowed absolute percentage‑point difference between Polygon EOD % and Stooq 1‑day % before dropping an item
 
 ### Local Development
 Option A: one‑shot helper script

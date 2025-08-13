@@ -11,7 +11,7 @@ function BiggestLosers({ onStockClick }) {
     const fetchLosers = async () => {
       try {
         setLoading(true)
-        const response = await fetch(`${API_BASE_URL}/interesting-losers?candidates=300&top=12`)
+        const response = await fetch(`${API_BASE_URL}/interesting-losers?candidates=300&top=10`)
         if (!response.ok) {
           throw new Error(`Failed to fetch biggest losers: ${response.status}`)
         }
