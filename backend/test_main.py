@@ -69,11 +69,16 @@ def test_quote_endpoint_ok(monkeypatch: pytest.MonkeyPatch):
 
 def test_chart_endpoint_ok(monkeypatch: pytest.MonkeyPatch):
     # Stooq-only path: stub history to deterministic series
+    # Use dates within the last few days so our range filter doesn't exclude them
+    from datetime import datetime, timedelta, timezone
+    today = datetime.now(timezone.utc).date()
+    yesterday = today - timedelta(days=1)
+    
     monkeypatch.setattr(
         "main._fetch_stooq_history",
         lambda sym: [
-            {"date": "2024-01-01", "date_iso": "2024-01-01T00:00:00+00:00", "open": 10, "high": 11, "low": 9, "close": 10, "volume": 1000},
-            {"date": "2024-01-02", "date_iso": "2024-01-02T00:00:00+00:00", "open": 10, "high": 12, "low": 9, "close": 11, "volume": 900},
+            {"date": yesterday.isoformat(), "date_iso": yesterday.isoformat() + "T00:00:00+00:00", "open": 10, "high": 11, "low": 9, "close": 10, "volume": 1000},
+            {"date": today.isoformat(), "date_iso": today.isoformat() + "T00:00:00+00:00", "open": 10, "high": 12, "low": 9, "close": 11, "volume": 900},
         ],
     )
     r = client.get("/chart/TSLA?range=1mo&interval=1d")
@@ -180,7 +185,7 @@ def test_llm_cannot_invent_symbol_not_in_candidates(monkeypatch: pytest.MonkeyPa
     Provide candidates with only RACE, but make the LLM try to return FERAR.
     The final curated list must not contain FERAR.
     """
-    from main import _refresh_interesting_losers_cache, LoserStock, INTERESTING_LOSERS_CACHE_TTL_SECONDS
+    from main import _refresh_interesting_losers_cache, LoserStock
     from main import _call_openai as real_call
 
     # Feed only RACE as an input loser

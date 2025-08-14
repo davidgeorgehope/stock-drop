@@ -77,7 +77,7 @@ function App() {
         (async () => {
           const entries = await Promise.all(syms.map(async (s) => {
             try {
-              const r = await fetch(`${API_BASE_URL}/chart/${encodeURIComponent(s)}?range=1mo&interval=1d`)
+              const r = await fetch(`${API_BASE_URL}/chart/${encodeURIComponent(s)}?range=5d&interval=1d`)
               if (!r.ok) throw new Error('chart failed')
               return [s, await r.json()]
             } catch {

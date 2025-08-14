@@ -607,6 +607,32 @@ def _fetch_yahoo_chart(symbol: str, range_: str, interval: str) -> ChartResponse
         return cached[1]
     hist = _fetch_daily_history_prefer_stooq(symbol)
     if hist:
+        # Filter data based on requested range
+        range_days = {
+            "1d": 1,
+            "5d": 5,
+            "1mo": 30,
+            "3mo": 90,
+            "6mo": 180,
+            "1y": 365,
+            "2y": 730,
+            "5y": 1825,
+            "max": None
+        }.get(range_)
+        
+        if range_days is not None:
+            # Filter to only include data within the requested range
+            cutoff_date = datetime.now(timezone.utc) - timedelta(days=range_days)
+            filtered_hist = []
+            for r in hist:
+                try:
+                    row_date = datetime.strptime(r["date"], "%Y-%m-%d").replace(tzinfo=timezone.utc)
+                    if row_date >= cutoff_date:
+                        filtered_hist.append(r)
+                except Exception:
+                    continue
+            hist = filtered_hist
+        
         ts = [int(datetime.strptime(r["date"], "%Y-%m-%d").replace(tzinfo=timezone.utc).timestamp()) for r in hist]
         response = ChartResponse(
             symbol=symbol,
@@ -848,7 +874,7 @@ def _get_cached_biggest_losers() -> List[LoserStock]:
 
 def _get_price_context(symbol: str) -> Optional[str]:
     quote = _fetch_yahoo_quote(symbol)
-    chart = _fetch_yahoo_chart(symbol, range_="1mo", interval="1d")
+    chart = _fetch_yahoo_chart(symbol, range_="5d", interval="1d")
     lines: List[str] = []
     if quote.price is not None:
         chg_pct = f"{quote.change_percent:.2f}%" if quote.change_percent is not None else "n/a"
@@ -1072,7 +1098,7 @@ def _generate_og_image_png(symbol: str) -> bytes:
     width, height = 1200, 630
     
     quote = _fetch_yahoo_quote(symbol)
-    chart = _fetch_yahoo_chart(symbol, range_="1mo", interval="1d")
+    chart = _fetch_yahoo_chart(symbol, range_="5d", interval="1d")
     closes = [c for c in (chart.closes or []) if isinstance(c, (int, float))]
 
     # Site-matching colors
@@ -1155,11 +1181,11 @@ def _generate_og_image_png(symbol: str) -> bytes:
         price_width = bbox[2] - bbox[0]
         right_x = width - padding
         draw.text((right_x - price_width, y + 5), _clean_text(price_text), font=med_font, fill=price_color)
-        # Second line: 1-month change to match the chart range
+        # Second line: change percentage matching the chart range
         try:
             if len(closes) >= 2 and closes[0] not in (None, 0):
                 m1_pct = ((closes[-1] - closes[0]) / closes[0]) * 100.0
-                m1_text = f"1mo {m1_pct:+.2f}%"
+                m1_text = f"{chart.range} {m1_pct:+.2f}%"
                 m1_color = red if m1_pct < 0 else green
                 m1_bbox = draw.textbbox((0, 0), _clean_text(m1_text), font=small_font)
                 m1_width = m1_bbox[2] - m1_bbox[0]
@@ -1196,7 +1222,7 @@ def _generate_og_image_png(symbol: str) -> bytes:
         draw.line(points, fill=line_color, width=3)
         
         # Range label and High/Low labels like site
-        draw.text((chart_right - 100, chart_top - 45), "Range: 1mo", font=tiny_font, fill=gray)
+        draw.text((chart_right - 100, chart_top - 45), f"Range: {chart.range}", font=tiny_font, fill=gray)
         draw.text((chart_right - 100, chart_top - 25), f"High: ${max_close:.2f}", font=tiny_font, fill=gray)
         draw.text((chart_right - 100, chart_bottom + 5), f"Low: ${min_close:.2f}", font=tiny_font, fill=gray)
     else:
