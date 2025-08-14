@@ -91,13 +91,13 @@ Base URL is `http://localhost:8000` in dev (or `/api` in production behind Nginx
 - Dev server runs on port `8080` (see `vite.config.js`)
 
 ### Caching & Background Jobs
-- In‑memory caches:
-  - Quotes: `QUOTE_CACHE_TTL_SECONDS` (default 60s)
-  - Charts: `CHART_CACHE_TTL_SECONDS` (default 300s)
-  - OG images: `OG_IMAGE_CACHE_TTL_SECONDS` (default 1800s)
-  - Curated losers: `INTERESTING_LOSERS_CACHE_TTL_SECONDS` (default 86400s)
-- News on‑disk cache (optional): `NEWS_CACHE_DIR` with `NEWS_CACHE_TTL_SECONDS` (default 7 days)
-- On startup, a background thread warms and periodically refreshes the curated losers cache.
+- Caches:
+  - Quotes: In-memory, 60s TTL (`QUOTE_CACHE_TTL_SECONDS`)
+  - Charts: In-memory, 300s TTL (`CHART_CACHE_TTL_SECONDS`)
+  - OG images: In-memory, expire at midnight ET (date-based keys)
+  - News: On-disk files, expire at midnight ET (date-based keys)
+  - Curated losers: In-memory, refreshes daily at 5pm ET
+- On startup, a background thread warms the losers cache and schedules daily 5pm ET refreshes.
 
 ### Configuration (Environment Variables)
 - `OPENAI_API_KEY` (required for LLM summaries; if missing, backend returns a generic fallback)
@@ -106,11 +106,8 @@ Base URL is `http://localhost:8000` in dev (or `/api` in production behind Nginx
 - `PUBLIC_WEB_ORIGIN` (e.g., `https://whyisthestockplummeting.com`; used in CORS and share pages)
 - `OG_FONT_PATH` (optional path to a TTF font for OG rendering; scripts set a good default on Linux)
 - `NEWS_CACHE_DIR` (default: `backend/.cache/news`)
-- `NEWS_CACHE_TTL_SECONDS` (default: `604800`)
 - `QUOTE_CACHE_TTL_SECONDS` (default: `60`)
 - `CHART_CACHE_TTL_SECONDS` (default: `300`)
-- `OG_IMAGE_CACHE_TTL_SECONDS` (default: `1800`)
-- `INTERESTING_LOSERS_CACHE_TTL_SECONDS` (default: `86400`)
  - `LOSERS_FINAL_STOOQ_CHECK` (default: `1`) — enable/disable final Stooq sanity filter for `/interesting-losers`
  - `LOSERS_FINAL_STOOQ_TOLERANCE_PPTS` (default: `25.0`) — max allowed absolute percentage‑point difference between Polygon EOD % and Stooq 1‑day % before dropping an item
 

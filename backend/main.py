@@ -70,10 +70,10 @@ def _rank_interesting_losers(candidates: List["LoserStock"], top_n: int = 10) ->
 
 def _get_interesting_losers(candidates: List["LoserStock"], top_n: int = 10) -> List["InterestingLoser"]:
     global INTERESTING_LOSERS_CACHE
-    now = time.time()
     with INTERESTING_LOSERS_LOCK:
-        if INTERESTING_LOSERS_CACHE and (now - INTERESTING_LOSERS_CACHE[0]) < INTERESTING_LOSERS_CACHE_TTL_SECONDS:
+        if INTERESTING_LOSERS_CACHE:
             return INTERESTING_LOSERS_CACHE[1]
+    # If no cache, compute it now (shouldn't happen after startup)
     ranked = _rank_interesting_losers(candidates, top_n)
     with INTERESTING_LOSERS_LOCK:
         INTERESTING_LOSERS_CACHE = (time.time(), ranked)
@@ -188,15 +188,49 @@ async def startup_event():
             print(f"Startup interesting cache init failed: {e}")
     threading.Thread(target=init_cache, daemon=True).start()
 
-    # Start daily/background refresh for both caches
-    def periodic_refresh():
+    # Start market-aware background refresh
+    def market_aware_refresh():
+        """Refresh losers cache ~1 hour after market close (5pm ET)."""
         while True:
-            time.sleep(INTERESTING_LOSERS_CACHE_TTL_SECONDS)
             try:
+                # Calculate time until next refresh (5pm ET)
+                now = datetime.now(ZoneInfo("America/New_York"))
+                today_refresh = now.replace(hour=17, minute=0, second=0, microsecond=0)  # 5pm ET
+                
+                # If we're past today's refresh time, schedule for tomorrow
+                if now >= today_refresh:
+                    next_refresh = today_refresh + timedelta(days=1)
+                else:
+                    next_refresh = today_refresh
+                
+                # Skip weekends
+                while next_refresh.weekday() >= 5:  # Saturday = 5, Sunday = 6
+                    next_refresh += timedelta(days=1)
+                
+                # Calculate seconds until next refresh
+                sleep_seconds = (next_refresh - now).total_seconds()
+                print(f"📅 Next losers refresh scheduled for {next_refresh.strftime('%Y-%m-%d %H:%M %Z')} ({sleep_seconds/3600:.1f} hours from now)")
+                
+                # Sleep until refresh time
+                time.sleep(max(60, sleep_seconds))  # At least 1 minute
+                
+                # Perform the refresh
+                print("🔄 Running scheduled market-close losers refresh...")
                 _refresh_interesting_losers_cache()
+                print("✅ Market-close losers refresh completed")
+                
+                # Also cleanup old caches
+                _cleanup_old_news_cache()
+                _cleanup_old_og_cache()
+                
+                # Sleep a bit to avoid tight loop if something goes wrong
+                time.sleep(60)
+                
             except Exception as e:
-                print(f"Periodic interesting refresh failed: {e}")
-    threading.Thread(target=periodic_refresh, daemon=True).start()
+                print(f"❌ Market-aware refresh error: {e}")
+                time.sleep(300)  # 5 minutes on error
+    
+    threading.Thread(target=market_aware_refresh, daemon=True).start()
     _app_started = True
     print("✅ Startup initialization queued")
 
@@ -254,16 +288,16 @@ def _search_news_for_symbol(symbol: str, days: int, max_results: int) -> List[So
     try:
         if NEWS_CACHE_DIR:
             os.makedirs(NEWS_CACHE_DIR, exist_ok=True)
-            cache_key = f"{symbol.upper()}_{days}_{max_results}.json"
+            # Include date in cache key so cache naturally expires each day
+            today = datetime.now(ZoneInfo("America/New_York")).date()
+            cache_key = f"{symbol.upper()}_{days}_{max_results}_{today.isoformat()}.json"
             cache_path = os.path.join(NEWS_CACHE_DIR, cache_key)
             if os.path.exists(cache_path):
                 try:
-                    mtime = os.path.getmtime(cache_path)
-                    if time.time() - mtime < NEWS_CACHE_TTL_SECONDS:
-                        import json as _json
-                        with open(cache_path, "r", encoding="utf-8") as f:
-                            cached = _json.load(f)
-                        return [SourceItem(**it) for it in cached]
+                    import json as _json
+                    with open(cache_path, "r", encoding="utf-8") as f:
+                        cached = _json.load(f)
+                    return [SourceItem(**it) for it in cached]
                 except Exception:
                     pass
     except Exception:
@@ -309,13 +343,54 @@ def _search_news_for_symbol(symbol: str, days: int, max_results: int) -> List[So
         if cleaned and NEWS_CACHE_DIR:
             import json as _json
             os.makedirs(NEWS_CACHE_DIR, exist_ok=True)
-            cache_key = f"{symbol.upper()}_{days}_{max_results}.json"
+            today = datetime.now(ZoneInfo("America/New_York")).date()
+            cache_key = f"{symbol.upper()}_{days}_{max_results}_{today.isoformat()}.json"
             cache_path = os.path.join(NEWS_CACHE_DIR, cache_key)
             with open(cache_path, "w", encoding="utf-8") as f:
                 _json.dump([c.model_dump() for c in cleaned], f)
     except Exception:
         pass
     return cleaned
+
+
+def _cleanup_old_news_cache():
+    """Remove news cache files older than 2 days to prevent disk bloat."""
+    if not NEWS_CACHE_DIR or not os.path.exists(NEWS_CACHE_DIR):
+        return
+    
+    try:
+        cutoff = time.time() - (2 * 86400)  # 2 days
+        for filename in os.listdir(NEWS_CACHE_DIR):
+            if filename.endswith('.json'):
+                filepath = os.path.join(NEWS_CACHE_DIR, filename)
+                try:
+                    if os.path.getmtime(filepath) < cutoff:
+                        os.remove(filepath)
+                except Exception:
+                    pass
+    except Exception as e:
+        print(f"News cache cleanup error: {e}")
+
+
+def _cleanup_old_og_cache():
+    """Remove OG image cache entries older than 2 days."""
+    try:
+        cutoff_date = (datetime.now(ZoneInfo("America/New_York")).date() - timedelta(days=2)).isoformat()
+        keys_to_remove = []
+        for key in list(OG_IMAGE_CACHE.keys()):
+            # Key format: SYMBOL_YYYY-MM-DD
+            if "_" in key:
+                date_part = key.split("_")[-1]
+                if date_part < cutoff_date:
+                    keys_to_remove.append(key)
+        
+        for key in keys_to_remove:
+            del OG_IMAGE_CACHE[key]
+        
+        if keys_to_remove:
+            print(f"🧹 Cleaned {len(keys_to_remove)} old OG cache entries")
+    except Exception as e:
+        print(f"OG cache cleanup error: {e}")
 
 
 def _build_llm_prompt(
@@ -753,26 +828,15 @@ def _refresh_biggest_losers_cache():
         print(f"❌ Failed to run interesting losers warm: {e}")
 
 
-def _background_refresh_loop():
-    # Legacy loop retained but now delegates to interesting cache refresh
-    while True:
-        try:
-            time.sleep(INTERESTING_LOSERS_CACHE_TTL_SECONDS)
-            _refresh_interesting_losers_cache()
-        except Exception as e:
-            print(f"❌ Background refresh error: {e}")
-            time.sleep(300)
+# Legacy background refresh loop removed - using market-aware refresh instead
 
 
 def _ensure_cache_initialized():
     """Initialize curated losers cache once in the background."""
-    global _background_refresh_task, _app_started
+    global _app_started
     if _app_started:
         return
     threading.Thread(target=_refresh_interesting_losers_cache, daemon=True).start()
-    if _background_refresh_task is None:
-        _background_refresh_task = threading.Thread(target=_background_refresh_loop, daemon=True)
-        _background_refresh_task.start()
     _app_started = True
 
 
@@ -824,21 +888,20 @@ def _is_non_primary_equity_symbol(symbol: str) -> bool:
     return False
 
 
-OG_IMAGE_CACHE_TTL_SECONDS = int(os.getenv("OG_IMAGE_CACHE_TTL_SECONDS", "1800"))
-OG_IMAGE_CACHE: dict[str, tuple[float, bytes]] = {}
+# OG images use date-based cache keys, expire at midnight ET
+OG_IMAGE_CACHE: dict[str, bytes] = {}
 
 # Background refresh state
-_background_refresh_task = None
 _app_started = False
 
 # Cache for interesting losers (LLM-ranked)
-INTERESTING_LOSERS_CACHE_TTL_SECONDS = int(os.getenv("INTERESTING_LOSERS_CACHE_TTL_SECONDS", "86400"))
+# Refreshes daily at 5pm ET (~1 hour after market close)
 INTERESTING_LOSERS_CACHE: Optional[tuple[float, List[InterestingLoser]]] = None
 INTERESTING_LOSERS_LOCK = threading.RLock()
 
 # Optional on-disk cache for news lookups to reduce DDG usage across restarts
+# Cache files include date in filename, so they naturally expire at midnight ET
 NEWS_CACHE_DIR = os.getenv("NEWS_CACHE_DIR") or os.path.join(os.path.dirname(__file__), ".cache", "news")
-NEWS_CACHE_TTL_SECONDS = int(os.getenv("NEWS_CACHE_TTL_SECONDS", "604800"))  # 7 days
 
 # In-memory EOD series cache built from grouped results (prev + target dates)
 EOD_SERIES_CACHE: dict[str, list[dict]] = {}
@@ -1278,11 +1341,11 @@ async def get_interesting_losers(
 ) -> InterestingLosersResponse:
     """Return curated losers from cache only; never compute in request path.
 
-    If cache is empty/not warmed yet, returns an empty list immediately.
+    Cache is refreshed daily at 5pm ET. If cache is not yet populated, returns empty list.
     """
     with INTERESTING_LOSERS_LOCK:
         cached = INTERESTING_LOSERS_CACHE
-    if cached and (time.time() - cached[0]) < INTERESTING_LOSERS_CACHE_TTL_SECONDS:
+    if cached:
         ranked = cached[1][:top]
         ts = cached[0]
     else:
@@ -1301,13 +1364,18 @@ async def og_image(symbol: str) -> Response:
     symbol = _sanitize_symbol(symbol)
     if not symbol:
         raise HTTPException(status_code=400, detail="Symbol is required")
-    now = time.time()
-    cached = OG_IMAGE_CACHE.get(symbol)
-    if cached and (now - cached[0]) < OG_IMAGE_CACHE_TTL_SECONDS:
-        image_bytes = cached[1]
+    
+    # Use date-based cache key
+    today = datetime.now(ZoneInfo("America/New_York")).date()
+    cache_key = f"{symbol}_{today.isoformat()}"
+    
+    cached = OG_IMAGE_CACHE.get(cache_key)
+    if cached:
+        image_bytes = cached
     else:
         image_bytes = _generate_og_image_png(symbol)
-        OG_IMAGE_CACHE[symbol] = (now, image_bytes)
+        OG_IMAGE_CACHE[cache_key] = image_bytes
+    
     etag = md5(image_bytes).hexdigest()
     headers = {
         "Cache-Control": "public, max-age=1800",
@@ -1325,12 +1393,16 @@ async def og_image_warm(symbol: str) -> Response:
     symbol = _sanitize_symbol(symbol)
     if not symbol:
         raise HTTPException(status_code=400, detail="Symbol is required")
-    now = time.time()
-    cached = OG_IMAGE_CACHE.get(symbol)
-    if cached and (now - cached[0]) < OG_IMAGE_CACHE_TTL_SECONDS:
+    
+    # Use date-based cache key
+    today = datetime.now(ZoneInfo("America/New_York")).date()
+    cache_key = f"{symbol}_{today.isoformat()}"
+    
+    if cache_key in OG_IMAGE_CACHE:
         return Response(status_code=204)
+    
     image_bytes = _generate_og_image_png(symbol)
-    OG_IMAGE_CACHE[symbol] = (time.time(), image_bytes)
+    OG_IMAGE_CACHE[cache_key] = image_bytes
     return Response(status_code=201)
 
 
