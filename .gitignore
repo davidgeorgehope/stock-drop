@@ -2,3 +2,4 @@ myenv/
 .env
 .venv/
 backend/.venv/
+backend/.cache/
