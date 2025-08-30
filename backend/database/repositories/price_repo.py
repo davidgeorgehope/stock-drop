@@ -3,6 +3,7 @@ from typing import List, Optional, Dict
 from sqlalchemy import select, and_
 from sqlalchemy.orm import Session, sessionmaker
 from sqlalchemy.exc import IntegrityError
+from sqlalchemy.dialects.sqlite import insert as sqlite_insert
 
 from ..models import PriceData
 from ..connection import get_engine
@@ -15,61 +16,59 @@ class PriceRepository:
     def _get_session():
         """Create a new SQLAlchemy session."""
         engine = get_engine()
-        Session = sessionmaker(bind=engine)
+        Session = sessionmaker(bind=engine, autoflush=False, autocommit=False)
         return Session()
     
     @staticmethod
     def save_polygon_grouped_data(date_str: str, grouped_data: List[dict]) -> int:
-        """Save Polygon grouped data to the database.
+        """Idempotently upsert Polygon grouped data into SQLite.
         
-        Returns the number of records saved.
+        Uses SQLite ON CONFLICT to avoid duplicate insert errors when multiple
+        threads/processes attempt to save the same trading day concurrently.
+        Returns the number of rows processed (inserts + updates best-effort).
         """
         session = PriceRepository._get_session()
         try:
-            records_saved = 0
-            
+            timestamp = datetime.strptime(date_str, "%Y-%m-%d")
+
+            # Prepare rows (filter out empty symbols)
+            values: List[Dict] = []
             for stock_data in grouped_data:
-                symbol = stock_data.get("T", "").upper()
+                symbol = (stock_data.get("T") or "").strip().upper()
                 if not symbol:
                     continue
-                    
-                # Convert timestamp to datetime
-                timestamp = datetime.strptime(date_str, "%Y-%m-%d")
-                
-                # Check if record exists
-                existing = session.query(PriceData).filter(
-                    and_(
-                        PriceData.symbol == symbol,
-                        PriceData.timestamp == timestamp,
-                        PriceData.source == "polygon_grouped"
-                    )
-                ).first()
-                
-                if existing:
-                    # Update existing record
-                    existing.open = stock_data.get("o")
-                    existing.high = stock_data.get("h")
-                    existing.low = stock_data.get("l")
-                    existing.close = stock_data.get("c")
-                    existing.volume = stock_data.get("v")
-                else:
-                    # Create new record
-                    price_data = PriceData(
-                        symbol=symbol,
-                        timestamp=timestamp,
-                        open=stock_data.get("o"),
-                        high=stock_data.get("h"),
-                        low=stock_data.get("l"),
-                        close=stock_data.get("c"),
-                        volume=stock_data.get("v"),
-                        source="polygon_grouped"
-                    )
-                    session.add(price_data)
-                
-                records_saved += 1
-            
+                values.append({
+                    "symbol": symbol,
+                    "timestamp": timestamp,
+                    "open": stock_data.get("o"),
+                    "high": stock_data.get("h"),
+                    "low": stock_data.get("l"),
+                    "close": stock_data.get("c"),
+                    "volume": stock_data.get("v"),
+                    "source": "polygon_grouped",
+                })
+
+            if not values:
+                return 0
+
+            # Batch upserts to keep statement sizes reasonable
+            batch_size = 1000
+            total_processed = 0
+            for i in range(0, len(values), batch_size):
+                batch = values[i:i + batch_size]
+                stmt = sqlite_insert(PriceData).values(batch)
+                update_cols = {c: stmt.excluded[c] for c in [
+                    "open", "high", "low", "close", "volume"
+                ]}
+                stmt = stmt.on_conflict_do_update(
+                    index_elements=[PriceData.symbol, PriceData.timestamp, PriceData.source],
+                    set_=update_cols,
+                )
+                session.execute(stmt)
+                total_processed += len(batch)
+
             session.commit()
-            return records_saved
+            return total_processed
         finally:
             session.close()
     
