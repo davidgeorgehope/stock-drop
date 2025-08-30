@@ -26,6 +26,7 @@ ENV_FILE="/etc/${APP_NAME}.env"
 SERVICE_FILE="/etc/systemd/system/${APP_NAME}-backend.service"
 NGINX_SITE="/etc/nginx/sites-available/${APP_NAME}.conf"
 NGINX_SITE_LINK="/etc/nginx/sites-enabled/${APP_NAME}.conf"
+DATA_DIR="/var/lib/${APP_NAME}"
 
 echo "--- Installing system packages ---"
 export DEBIAN_FRONTEND=noninteractive
@@ -60,6 +61,10 @@ mkdir -p "$FRONTEND_WEB_ROOT"
 rsync -a --delete "$FRONTEND_BUILD_DIR"/ "$FRONTEND_WEB_ROOT"/
 chown -R www-data:www-data "$FRONTEND_WEB_ROOT"
 
+echo "--- Preparing application data dir at ${DATA_DIR} ---"
+mkdir -p "${DATA_DIR}/news"
+chown -R www-data:www-data "${DATA_DIR}"
+
 echo "--- Writing environment file at ${ENV_FILE} ---"
 touch "$ENV_FILE"
 chmod 600 "$ENV_FILE"
@@ -68,6 +73,16 @@ if ! grep -q "^PUBLIC_WEB_ORIGIN=" "$ENV_FILE" 2>/dev/null; then
 fi
 if ! grep -q "^OPENAI_API_KEY=" "$ENV_FILE" 2>/dev/null; then
   echo "OPENAI_API_KEY=CHANGE_ME" >> "$ENV_FILE"
+fi
+
+# Persist SQLite DB under /var/lib with proper permissions
+if ! grep -q "^SQLITE_DB_PATH=" "$ENV_FILE" 2>/dev/null; then
+  echo "SQLITE_DB_PATH=${DATA_DIR}/stockdrop.db" >> "$ENV_FILE"
+fi
+
+# Persist news cache outside code directory
+if ! grep -q "^NEWS_CACHE_DIR=" "$ENV_FILE" 2>/dev/null; then
+  echo "NEWS_CACHE_DIR=${DATA_DIR}/news" >> "$ENV_FILE"
 fi
 
 # Prefer a known, scalable font for OG image rendering

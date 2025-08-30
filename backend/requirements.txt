@@ -12,3 +12,4 @@ h2
 pytest
 pytest
 Pillow
+SQLAlchemy>=2.0,<3.0

@@ -1,8 +1,9 @@
 import { useState, useRef, useEffect } from 'react'
 import Header from './components/Header'
-import { API_BASE_URL } from './config'
+import { API_BASE_URL, DEV_SIGNALS_ENABLED } from './config'
 import Sparkline from './components/Sparkline'
 import BiggestLosers from './components/BiggestLosers'
+import SignalsDev from './components/SignalsDev'
 
 function App() {
   const [symbols, setSymbols] = useState('')
@@ -163,7 +164,11 @@ function App() {
             </div>
           ))}
         </div>
+        {DEV_SIGNALS_ENABLED && (
+        <SignalsDev />
+      )}
       </div>
+
     </div>
   )
 }

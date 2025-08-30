@@ -31,6 +31,8 @@ cleanup() {
 trap cleanup SIGINT SIGTERM EXIT
 
 # --- Backend ---
+println() { printf "%s\n" "$*"; }
+
 echo "--- Setting up Python backend ---"
 cd backend
 
@@ -40,13 +42,37 @@ if [ -f ../.env ]; then
   export $(grep -v '^#' ../.env | xargs -I{} echo {})
 fi
 
+# Ensure SQLite local path for development
+export SQLITE_DB_PATH=${SQLITE_DB_PATH:-"$(pwd)/data/stockdrop.db"}
+mkdir -p "$(dirname "$SQLITE_DB_PATH")"
+
+# Enable dev signals UI for frontend
+export VITE_DEV_SIGNALS=1
+
+# Allow cache pre-population but with smart rate limiting
+# Commenting out to allow SQLite population on startup
+# export SKIP_CACHE_PREPOPULATION=1
+
+echo "Activating virtual environment..."
+if [ -f ../.venv/bin/activate ]; then
+    source ../.venv/bin/activate
+elif [ -f ../venv/bin/activate ]; then
+    source ../venv/bin/activate
+elif [ -f ../myenv/bin/activate ]; then
+    source ../myenv/bin/activate
+else
+    echo "No virtual environment found. Creating one..."
+    python3 -m venv ../.venv
+    source ../.venv/bin/activate
+fi
+
 echo "Installing Python dependencies from requirements.txt..."
-python3 -m pip install --disable-pip-version-check --quiet -r requirements.txt
+python -m pip install --disable-pip-version-check --quiet -r requirements.txt
 
 echo "Starting backend server in the background..."
 # set -m allows job control, which is important for killing the process group
 set -m
-python3 -m uvicorn main:app --reload --host 0.0.0.0 --port 8000 &
+python -m uvicorn main:app --reload --host 0.0.0.0 --port 8000 &
 BACKEND_PID=$!
 set +m
 cd ..
@@ -65,4 +91,4 @@ npm install --silent
 
 echo -e "\nStarting frontend dev server... (Press Ctrl+C to stop everything)"
 # The 'trap' will handle shutting down the backend when this command exits.
-npm run dev 
+VITE_DEV_SIGNALS=1 npm run dev 

@@ -219,6 +219,14 @@ def test_llm_cannot_invent_symbol_not_in_candidates(monkeypatch: pytest.MonkeyPa
     assert "RACE" in symbols
     assert "FERAR" not in symbols
 
+    # Cleanup DB batch created by this test so it doesn't leak into dev data
+    try:
+        from database.repositories.losers_repo import LosersRepository
+        from main import _determine_eod_target_date
+        LosersRepository.save_ranked(_determine_eod_target_date().isoformat(), [], session_label="EOD")
+    except Exception:
+        pass
+
 
 def test_bogus_upstream_symbol_filtered_out(monkeypatch: pytest.MonkeyPatch):
     """If grouped returns a non-primary symbol like FERAR, it should be filtered out."""
@@ -259,6 +267,14 @@ def test_bogus_upstream_symbol_filtered_out(monkeypatch: pytest.MonkeyPatch):
     # With the new filter, non-primary symbols like FERAR are excluded
     assert "FERAR" not in symbols
     assert "RACE" in symbols
+
+    # Cleanup DB batch created by this test so it doesn't leak into dev data
+    try:
+        from database.repositories.losers_repo import LosersRepository
+        from main import _determine_eod_target_date
+        LosersRepository.save_ranked(_determine_eod_target_date().isoformat(), [], session_label="EOD")
+    except Exception:
+        pass
 
 
 def test_rights_like_symbol_drop_value_from_grouped_math(monkeypatch: pytest.MonkeyPatch):
