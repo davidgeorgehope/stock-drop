@@ -3,4 +3,5 @@ myenv/
 .venv/
 backend/.venv/
 backend/.cache/
-backend/data/
+backend/data
+data/
