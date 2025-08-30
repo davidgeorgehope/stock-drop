@@ -43,6 +43,7 @@ from database.repositories.losers_repo import LosersRepository
 from services.og_image import (
     OG_IMAGE_CACHE, _generate_og_image_png, _build_share_description
 )
+from services.jobs import submit_job, get_job, start_cleanup_daemon
 
 # Import database components
 from database.connection import get_engine, init_db
@@ -101,6 +102,15 @@ try:
     _md._fetch_stooq_history = lambda symbol: _fetch_stooq_history(symbol)  # type: ignore
     _md._fetch_polygon_grouped = lambda date_str: _fetch_polygon_grouped(date_str)  # type: ignore
     _md._determine_eod_target_date = lambda now_utc=None: _determine_eod_target_date(now_utc)  # type: ignore
+except Exception:
+    pass
+
+# Bridge functions for services.og_image so tests monkeypatching main.* affect it
+try:
+    import services.og_image as _og
+    _og._fetch_stooq_quote_only = lambda symbol: _fetch_yahoo_quote(symbol)  # type: ignore
+    _og._fetch_stooq_chart_only = lambda symbol, range_, interval: _fetch_yahoo_chart(symbol, range_, interval)  # type: ignore
+    _og._get_price_context_stooq_only = lambda symbol: _get_price_context_stooq_only(symbol)  # type: ignore
 except Exception:
     pass
 
@@ -351,6 +361,12 @@ async def startup_event():
     
     # Start oversold scheduler
     _start_oversold_scheduler()
+    
+    # Start background job cleanup daemon
+    try:
+        start_cleanup_daemon()
+    except Exception as e:
+        print(f"Job cleanup daemon failed to start: {e}")
     
     config._app_started = True
     print("✅ Startup initialization queued")
@@ -672,230 +688,6 @@ def premium_oversold_news(symbol: str, db: Session = Depends(get_db_session)):
 
 ## Removed S&P/NASDAQ universe filtering to avoid redundancy per product direction
 
-def _generate_og_image_png(symbol: str) -> bytes:
-    # Match the actual site's look - dark background, detailed commentary
-    width, height = 1200, 630
-    
-    quote = _fetch_yahoo_quote(symbol)
-    chart = _fetch_yahoo_chart(symbol, range_="5d", interval="1d")
-    closes = [c for c in (chart.closes or []) if isinstance(c, (int, float))]
-
-    # Site-matching colors
-    bg = (15, 18, 24)  # Dark blue-gray like the site
-    white = (255, 255, 255)
-    gray = (156, 163, 175)
-    red = (248, 113, 113)  # Softer red like site
-    green = (34, 197, 94)
-    
-    img = Image.new("RGB", (width, height), bg)
-    draw = ImageDraw.Draw(img)
-
-    # Font setup
-    def _load_font(size: int):
-        """Load a scalable TrueType font so size changes actually apply.
-
-        Falls back through common system font paths and an OG_FONT_PATH env var.
-        If none are available, uses PIL's default bitmap font (fixed size).
-        """
-        # Allow override via env var
-        env_font = os.getenv("OG_FONT_PATH")
-        candidates = [env_font] if env_font else []
-        # Common locations
-        candidates.extend([
-            "DejaVuSans.ttf",
-            "/usr/share/fonts/truetype/dejavu/DejaVuSans.ttf",
-            "/usr/share/fonts/truetype/liberation/LiberationSans-Regular.ttf",
-            "/usr/share/fonts/truetype/freefont/FreeSans.ttf",
-            # Common on Ubuntu minimal images
-            "/usr/share/fonts/truetype/noto/NotoSans-Regular.ttf",
-            "/usr/share/fonts/truetype/ubuntu/Ubuntu-R.ttf",
-            "/Library/Fonts/Arial.ttf",
-            "/System/Library/Fonts/Supplemental/Arial.ttf",
-            "/System/Library/Fonts/Supplemental/Helvetica.ttf",
-        ])
-        for path in candidates:
-            try:
-                if path and os.path.exists(path) or path and not os.path.isabs(path):
-                    return ImageFont.truetype(path, size)
-            except Exception:
-                continue
-        # Try PIL's bundled DejaVu
-        try:
-            import PIL  # type: ignore
-            pil_dir = os.path.dirname(PIL.__file__)
-            bundled = os.path.join(pil_dir, "fonts", "DejaVuSans.ttf")
-            return ImageFont.truetype(bundled, size)
-        except Exception:
-            pass
-        # Last resort (fixed size)
-        return ImageFont.load_default()
-
-    # Slightly larger fonts so preview text is easier to read
-    big_font = _load_font(56)
-    med_font = _load_font(36)
-    small_font = _load_font(28)
-    tiny_font = _load_font(20)
-
-    # ASCII-safe text
-    def _clean_text(text: str) -> str:
-        text = text.replace("\u2014", "-").replace("\u2013", "-")
-        return text.encode("ascii", "ignore").decode("ascii")
-
-    # Layout: symbol + price on top row, chart on right, commentary filling left
-    # Top row: Symbol and price
-    padding = 40
-    y = 40
-    
-    # Symbol
-    draw.text((padding, y), _clean_text(symbol), font=big_font, fill=white)
-    
-    # Price on same line, right side
-    if quote.price is not None:
-        chg = quote.change or 0.0
-        chg_pct = quote.change_percent or 0.0
-        price_color = red if chg < 0 else green
-        price_text = f"${quote.price:.2f}  1d {chg:+.2f} ({chg_pct:+.2f}%)"
-        # Measure text to position it right-aligned
-        bbox = draw.textbbox((0, 0), _clean_text(price_text), font=med_font)
-        price_width = bbox[2] - bbox[0]
-        right_x = width - padding
-        draw.text((right_x - price_width, y + 5), _clean_text(price_text), font=med_font, fill=price_color)
-        # Second line: change percentage matching the chart range
-        try:
-            if len(closes) >= 2 and closes[0] not in (None, 0):
-                m1_pct = ((closes[-1] - closes[0]) / closes[0]) * 100.0
-                m1_text = f"{chart.range} {m1_pct:+.2f}%"
-                m1_color = red if m1_pct < 0 else green
-                m1_bbox = draw.textbbox((0, 0), _clean_text(m1_text), font=small_font)
-                m1_width = m1_bbox[2] - m1_bbox[0]
-                # Slightly larger offset so it doesn't crowd the top labels
-                draw.text((right_x - m1_width, y + 5 + 48), _clean_text(m1_text), font=small_font, fill=m1_color)
-        except Exception:
-            pass
-    
-    # Chart area - compact, top right
-    # Move chart down to avoid overlapping with the top-right price lines
-    chart_y = y + 130
-    chart_height = 180
-    chart_width = 400
-    chart_left = width - padding - chart_width
-    chart_right = width - padding
-    chart_top = chart_y
-    chart_bottom = chart_y + chart_height
-    
-    if len(closes) >= 2:
-        # Sparkline similar to site
-        min_close = min(closes)
-        max_close = max(closes)
-        price_range = max_close - min_close if max_close != min_close else 1
-        
-        points = []
-        for i, price in enumerate(closes):
-            x = chart_left + (i / (len(closes) - 1)) * chart_width
-            y_norm = (price - min_close) / price_range
-            y = chart_bottom - (y_norm * chart_height)
-            points.append((x, y))
-        
-        # Chart line - match site style
-        line_color = red if closes[-1] < closes[0] else green
-        draw.line(points, fill=line_color, width=3)
-        
-        # Range label and High/Low labels like site
-        draw.text((chart_right - 100, chart_top - 45), f"Range: {chart.range}", font=tiny_font, fill=gray)
-        draw.text((chart_right - 100, chart_top - 25), f"High: ${max_close:.2f}", font=tiny_font, fill=gray)
-        draw.text((chart_right - 100, chart_bottom + 5), f"Low: ${min_close:.2f}", font=tiny_font, fill=gray)
-    else:
-        print(f"⚠️ OG chart missing series for {symbol}; history points: {len(closes)}")
-    
-    # Commentary - get actual analysis like the site shows
-    def _get_full_commentary() -> str:
-        try:
-            # Try to get actual analysis from the backend
-            sources = _search_news_for_symbol(symbol, days=7, max_results=8)
-            price_ctx = _get_price_context_stooq_only(symbol)
-            # Keep OG image preview succinct
-            prompt = _build_llm_prompt(symbol, sources, "humorous", price_ctx, max_words=80)
-            analysis = _call_openai(prompt)
-            if analysis and len(analysis.strip()) > 20:
-                return analysis.strip()
-        except Exception:
-            pass
-        return f"The market's been rough on {symbol} lately. Between earnings volatility, analyst downgrades, and general market jitters, it's showing the classic signs of a stock in consolidation mode. Recent price action suggests investors are taking profits and reassessing valuations amid broader market uncertainty."
-    
-    commentary = _clean_text(_get_full_commentary())
-    # Safety net: trim to max words to avoid awkward mid-word cuts
-    def _trim_words(text: str, max_words: int) -> str:
-        words = text.split()
-        if len(words) <= max_words:
-            return text
-        return " ".join(words[:max_words]) + "…"
-
-    commentary = _trim_words(commentary, 85)
-    
-    # Commentary area - left side, flowing around chart
-    text_left = padding
-    text_right = chart_left - 20  # Leave gap before chart
-    text_top = chart_y
-    text_width = text_right - text_left
-    
-    # Wrap text carefully
-    wrapped_lines = []
-    words = commentary.split()
-    current_line = ""
-    
-    for word in words:
-        test_line = current_line + (" " if current_line else "") + word
-        bbox = draw.textbbox((0, 0), test_line, font=small_font)
-        line_width = bbox[2] - bbox[0]
-        
-        if line_width <= text_width:
-            current_line = test_line
-        else:
-            if current_line:
-                wrapped_lines.append(current_line)
-            current_line = word
-    
-    if current_line:
-        wrapped_lines.append(current_line)
-    
-    # Draw commentary lines with dynamic height based on font metrics
-    bbox_sample = draw.textbbox((0, 0), "Ag", font=small_font)
-    line_height = (bbox_sample[3] - bbox_sample[1]) + 8
-    y = text_top
-    for line in wrapped_lines:
-        if y > height - 60:  # Don't go too close to bottom
-            break
-        draw.text((text_left, y), line, font=small_font, fill=white)
-        y += line_height
-    
-    # Footer
-    draw.text((padding, height - 30), "whyisthestockplummeting.com", font=tiny_font, fill=gray)
-    
-    buf = BytesIO()
-    img.save(buf, format="PNG", optimize=True)
-    return buf.getvalue()
-
-
-def _build_share_description(symbol: str) -> str:
-    parts: List[str] = []
-    price_ctx = _get_price_context_stooq_only(symbol)
-    if price_ctx:
-        parts.append(price_ctx)
-    # Add up to two recent headlines for flavor
-    try:
-        news = _search_news_for_symbol(symbol, days=7, max_results=3)
-        if news:
-            titles = [n.title for n in news[:2] if n.title]
-            if titles:
-                parts.append("; ".join(titles))
-    except Exception:
-        pass
-    if not parts:
-        parts.append("Tap to see a quick chart and summary.")
-    # Keep description short for social previews
-    desc = " — ".join(parts)
-    return desc[:280]
-
 
 @app.post("/analyze", response_model=AnalyzeResponse)
 async def analyze(request: AnalyzeRequest) -> AnalyzeResponse:
@@ -914,6 +706,46 @@ async def analyze(request: AnalyzeRequest) -> AnalyzeResponse:
         )
 
     return AnalyzeResponse(results=results)
+
+
+@app.post("/analyze/async", status_code=202)
+async def analyze_async(request: AnalyzeRequest):
+    symbols = _ensure_list_symbols(request.symbols)
+    if not symbols:
+        raise HTTPException(status_code=400, detail="No symbols provided")
+
+    def job_func():
+        out: List[dict] = []
+        for symbol in symbols:
+            sources = _search_news_for_symbol(symbol, request.days, request.max_results)
+            price_ctx = _get_price_context_stooq_only(symbol)
+            prompt = _build_llm_prompt(symbol, sources, request.tone, price_ctx)
+            summary = _call_openai(prompt)
+            out.append({
+                "symbol": symbol,
+                "summary": summary,
+                "sources": [s.model_dump() for s in sources],
+            })
+        return {"results": out}
+
+    job_id = submit_job("analyze", job_func)
+    return {"job_id": job_id, "status_url": f"/jobs/{job_id}"}
+
+
+@app.get("/jobs/{job_id}")
+async def job_status(job_id: str):
+    job = get_job(job_id)
+    if not job:
+        raise HTTPException(404, detail="Job not found")
+    # Shape for frontend
+    return {
+        "id": job.get("id"),
+        "type": job.get("type"),
+        "status": job.get("status"),
+        "result": job.get("result"),
+        "error": job.get("error"),
+        "progress": job.get("progress"),
+    }
 
 
 @app.get("/quote/{symbol}", response_model=QuoteResponse)
@@ -1020,6 +852,41 @@ async def og_image_warm(symbol: str) -> Response:
     image_bytes = _generate_og_image_png(symbol)
     OG_IMAGE_CACHE[cache_key] = image_bytes
     return Response(status_code=201)
+
+
+@app.post("/og-image/warm/{symbol}/async", status_code=202)
+async def og_image_warm_async(symbol: str):
+    """Queue background OG image generation and return a job id for polling."""
+    symbol = _sanitize_symbol(symbol)
+    if not symbol:
+        raise HTTPException(status_code=400, detail="Symbol is required")
+
+    today = datetime.now(ZoneInfo("America/New_York")).date()
+    cache_key = f"{symbol}_{today.isoformat()}"
+
+    def job_func():
+        # Generate and cache
+        image_bytes = _generate_og_image_png(symbol)
+        OG_IMAGE_CACHE[cache_key] = image_bytes
+        return {"cache_key": cache_key}
+
+    job_id = submit_job("og_image_warm", job_func)
+    return {"job_id": job_id, "status_url": f"/jobs/{job_id}", "status_check": f"/og-image/status/{symbol}"}
+
+
+@app.get("/og-image/status/{symbol}")
+async def og_image_status(symbol: str):
+    symbol = _sanitize_symbol(symbol)
+    if not symbol:
+        raise HTTPException(status_code=400, detail="Symbol is required")
+
+    today = datetime.now(ZoneInfo("America/New_York")).date()
+    cache_key = f"{symbol}_{today.isoformat()}"
+    cached = OG_IMAGE_CACHE.get(cache_key)
+    if not cached:
+        return {"symbol": symbol, "ready": False}
+    etag = md5(cached).hexdigest()
+    return {"symbol": symbol, "ready": True, "etag": etag}
 
 
 @app.get("/s/{symbol}")

@@ -12,7 +12,12 @@ function App() {
   const [error, setError] = useState('')
   const [quotes, setQuotes] = useState({})
   const [charts, setCharts] = useState({})
+  const [ogReady, setOgReady] = useState({})
+  const ogPollRef = useRef(null)
   const resultsRef = useRef(null)
+  useEffect(() => {
+    return () => { if (ogPollRef.current) clearInterval(ogPollRef.current) }
+  }, [])
 
   const handleLoserClick = (symbol) => {
     // Set the clicked symbol in the input and trigger analysis
@@ -28,7 +33,7 @@ function App() {
       setError('Please enter at least one stock symbol')
       return
     }
-    // Kick off OG image generation immediately so previews are ready when results render
+    // Kick off OG image generation in the background for all input symbols (async queue)
     try {
       const warmSymbols = Array.from(new Set(
         input
@@ -36,19 +41,44 @@ function App() {
           .map((s) => s.trim().toUpperCase())
           .filter(Boolean)
       ))
+      setOgReady((prev) => {
+        const next = { ...prev }
+        warmSymbols.forEach((s) => { next[s] = false })
+        return next
+      })
       ;(async () => {
         await Promise.allSettled(
           warmSymbols.map((s) =>
-            fetch(`${API_BASE_URL}/og-image/warm/${encodeURIComponent(s)}`, { method: 'POST' })
+            fetch(`${API_BASE_URL}/og-image/warm/${encodeURIComponent(s)}/async`, { method: 'POST' })
           )
         )
       })()
+      // Begin polling OG status until ready for each symbol
+      if (ogPollRef.current) clearInterval(ogPollRef.current)
+      ogPollRef.current = setInterval(async () => {
+        try {
+          const checks = await Promise.all(
+            warmSymbols.map(async (s) => {
+              const r = await fetch(`${API_BASE_URL}/og-image/status/${encodeURIComponent(s)}`)
+              if (!r.ok) return [s, false]
+              const j = await r.json()
+              return [s, !!j.ready]
+            })
+          )
+          setOgReady((prev) => {
+            const next = { ...prev }
+            checks.forEach(([s, ready]) => { if (ready) next[s] = true })
+            return next
+          })
+        } catch {}
+      }, 1200)
     } catch {}
     setLoading(true)
     setError('')
     setResults([])
     try {
-      const response = await fetch(`${API_BASE_URL}/analyze`, {
+      // Submit async analyze job
+      const response = await fetch(`${API_BASE_URL}/analyze/async`, {
         method: 'POST',
         headers: { 'Content-Type': 'application/json' },
         body: JSON.stringify({ symbols: input, days: 7, max_results: 8, tone: 'humorous' })
@@ -57,37 +87,91 @@ function App() {
         const txt = await response.text()
         throw new Error(`${response.status}: ${txt}`)
       }
-      const data = await response.json()
-      const analysisResults = data.results || []
-      setResults(analysisResults)
-      // Fetch quotes and mini charts in parallel for each symbol
-      const syms = analysisResults.map(r => r.symbol)
-      await Promise.all([
-        (async () => {
-          const entries = await Promise.all(syms.map(async (s) => {
-            try {
-              const r = await fetch(`${API_BASE_URL}/quote/${encodeURIComponent(s)}`)
-              if (!r.ok) throw new Error('quote failed')
-              return [s, await r.json()]
-            } catch {
-              return [s, null]
+      const { job_id } = await response.json()
+      // Poll job until completed or failed
+      const started = Date.now()
+      const timeoutMs = 90_000
+      let done = false
+      while (!done) {
+        const jr = await fetch(`${API_BASE_URL}/jobs/${encodeURIComponent(job_id)}`)
+        if (!jr.ok) throw new Error('job status check failed')
+        const js = await jr.json()
+        if (js.status === 'completed') {
+          const analysisResults = (js.result?.results) || []
+          setResults(analysisResults)
+          // Fetch quotes and mini charts in parallel for each symbol
+          const syms = analysisResults.map(r => r.symbol)
+          await Promise.all([
+            (async () => {
+              const entries = await Promise.all(syms.map(async (s) => {
+                try {
+                  const r = await fetch(`${API_BASE_URL}/quote/${encodeURIComponent(s)}`)
+                  if (!r.ok) throw new Error('quote failed')
+                  return [s, await r.json()]
+                } catch {
+                  return [s, null]
+                }
+              }))
+              setQuotes(Object.fromEntries(entries))
+            })(),
+            (async () => {
+              const entries = await Promise.all(syms.map(async (s) => {
+                try {
+                  const r = await fetch(`${API_BASE_URL}/chart/${encodeURIComponent(s)}?range=5d&interval=1d`)
+                  if (!r.ok) throw new Error('chart failed')
+                  return [s, await r.json()]
+                } catch {
+                  return [s, null]
+                }
+              }))
+              setCharts(Object.fromEntries(entries))
+            })()
+          ])
+          // Wait for OG images for these symbols before rendering analysis
+          try {
+            const startOgWait = Date.now()
+            const ogTimeout = 20000 // 20s cap
+            // quick helper to check readiness via API to avoid race on state updates
+            const checkReady = async () => {
+              const pairs = await Promise.all(syms.map(async (s) => {
+                try {
+                  const rr = await fetch(`${API_BASE_URL}/og-image/status/${encodeURIComponent(s)}`)
+                  if (!rr.ok) return [s, false]
+                  const jj = await rr.json()
+                  return [s, !!jj.ready]
+                } catch { return [s, false] }
+              }))
+              return pairs
             }
-          }))
-          setQuotes(Object.fromEntries(entries))
-        })(),
-        (async () => {
-          const entries = await Promise.all(syms.map(async (s) => {
-            try {
-              const r = await fetch(`${API_BASE_URL}/chart/${encodeURIComponent(s)}?range=5d&interval=1d`)
-              if (!r.ok) throw new Error('chart failed')
-              return [s, await r.json()]
-            } catch {
-              return [s, null]
+            let pairs = await checkReady()
+            let allReady = pairs.every(([, ready]) => ready)
+            while (!allReady && (Date.now() - startOgWait) < ogTimeout) {
+              await new Promise((res) => setTimeout(res, 800))
+              pairs = await checkReady()
+              allReady = pairs.every(([, ready]) => ready)
             }
-          }))
-          setCharts(Object.fromEntries(entries))
-        })()
-      ])
+            if (allReady) {
+              // Ensure UI flips to images immediately by setting ogReady for these symbols
+              setOgReady((prev) => {
+                const next = { ...prev }
+                pairs.forEach(([s, ready]) => { if (ready) next[s] = true })
+                return next
+              })
+              if (ogPollRef.current) { clearInterval(ogPollRef.current); ogPollRef.current = null }
+            }
+          } catch {}
+          // Now render analysis results
+          setResults(analysisResults)
+          done = true
+          break
+        } else if (js.status === 'failed') {
+          throw new Error(js.error || 'analysis failed')
+        }
+        if (Date.now() - started > timeoutMs) {
+          throw new Error('Request timed out, please try again')
+        }
+        await new Promise((res) => setTimeout(res, 1200))
+      }
     } catch (e) {
       setError(e.message || 'Something went sideways')
     } finally {
@@ -134,14 +218,18 @@ function App() {
             <div key={r.symbol} className="bg-gray-800 p-6 rounded-lg shadow-lg">
               
 
-              {/* OG preview image from backend */}
+              {/* OG preview image from backend - render only when ready to avoid heavy sync work */}
               <div className="mb-4">
-                <img
-                  src={`${API_BASE_URL}/og-image/${encodeURIComponent(r.symbol)}.png`}
-                  alt={`${r.symbol} preview`}
-                  className="w-full rounded-md border border-gray-700"
-                  loading="lazy"
-                />
+                {ogReady[r.symbol] ? (
+                  <img
+                    src={`${API_BASE_URL}/og-image/${encodeURIComponent(r.symbol)}.png`}
+                    alt={`${r.symbol} preview`}
+                    className="w-full rounded-md border border-gray-700"
+                    loading="lazy"
+                  />
+                ) : (
+                  <div className="w-full h-48 rounded-md border border-gray-700 bg-gray-700/50 animate-pulse" />
+                )}
               </div>
 
               <div className="prose prose-invert max-w-none whitespace-pre-wrap leading-relaxed">
