@@ -169,3 +169,17 @@ class InterestingLoserDB(Base):
 	session: Mapped[Optional[str]] = mapped_column(String)
 	created_at: Mapped[Optional[str]] = mapped_column(DateTime, server_default=func.current_timestamp(), index=True)
 
+
+class JobRecord(Base):
+	__tablename__ = "jobs"
+
+	id: Mapped[str] = mapped_column(String, primary_key=True)
+	type: Mapped[str] = mapped_column(String)
+	status: Mapped[str] = mapped_column(String, index=True)
+	created_at: Mapped[Optional[str]] = mapped_column(DateTime, server_default=func.current_timestamp(), index=True)
+	updated_at: Mapped[Optional[str]] = mapped_column(DateTime, server_default=func.current_timestamp())
+	result_json: Mapped[Optional[str]] = mapped_column(Text)
+	error: Mapped[Optional[str]] = mapped_column(Text)
+	progress: Mapped[Optional[float]] = mapped_column(Float)
+	expires_at: Mapped[Optional[str]] = mapped_column(DateTime, index=True)
+

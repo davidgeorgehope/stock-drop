@@ -10,80 +10,104 @@ from __future__ import annotations
 import threading
 import time
 import uuid
+import json
+from datetime import datetime, timezone, timedelta
 from typing import Any, Callable, Dict, Optional
 
+from sqlalchemy.orm import sessionmaker
+from database.connection import get_engine
+from database.models import JobRecord
 
-class Job:
-    def __init__(self, job_type: str):
-        self.id: str = str(uuid.uuid4())
-        self.type: str = job_type
-        self.status: str = "queued"  # queued | running | completed | failed
-        self.created_at: float = time.time()
-        self.updated_at: float = self.created_at
-        self.result: Optional[Any] = None
-        self.error: Optional[str] = None
-        self.progress: float = 0.0
-        self.expires_at: float = self.created_at + 3600  # 1 hour TTL by default
 
-    def to_dict(self) -> Dict[str, Any]:
-        return {
-            "id": self.id,
-            "type": self.type,
-            "status": self.status,
-            "created_at": self.created_at,
-            "updated_at": self.updated_at,
-            "result": self.result,
-            "error": self.error,
-            "progress": self.progress,
-            "expires_at": self.expires_at,
-        }
+def _utcnow() -> datetime:
+    return datetime.now(timezone.utc)
 
 
 class JobStore:
+    """SQLite-backed job store so multiple workers share state.
+
+    Execution still happens in a local thread; state changes are persisted.
+    """
+
     def __init__(self):
-        self._jobs: Dict[str, Job] = {}
-        self._lock = threading.Lock()
+        engine = get_engine()
+        self._maker = sessionmaker(bind=engine, autoflush=False, autocommit=False)
         self._cleanup_started = False
 
+    def _write(self, record: JobRecord):
+        with self._maker() as db:
+            try:
+                db.merge(record)
+                db.commit()
+            except Exception:
+                db.rollback()
+                raise
+
     def submit(self, job_type: str, func: Callable[[], Any]) -> str:
-        job = Job(job_type)
-        with self._lock:
-            self._jobs[job.id] = job
+        job_id = str(uuid.uuid4())
+        now = _utcnow()
+        rec = JobRecord(
+            id=job_id,
+            type=job_type,
+            status="queued",
+            created_at=now,
+            updated_at=now,
+            result_json=None,
+            error=None,
+            progress=0.0,
+            expires_at=now + timedelta(hours=1),
+        )
+        self._write(rec)
 
         def runner():
             try:
-                job.status = "running"
-                job.updated_at = time.time()
+                # mark running
+                rec.status = "running"
+                rec.updated_at = _utcnow()
+                self._write(rec)
+
                 result = func()
-                job.result = result
-                job.status = "completed"
-                job.progress = 1.0
-                job.updated_at = time.time()
-                # Extend TTL after completion so clients can retrieve
-                job.expires_at = time.time() + 3600
+                rec.result_json = json.dumps(result) if result is not None else None
+                rec.status = "completed"
+                rec.progress = 1.0
+                rec.updated_at = _utcnow()
+                rec.expires_at = _utcnow() + timedelta(hours=1)
+                self._write(rec)
             except Exception as e:
-                job.error = f"{type(e).__name__}: {e}"
-                job.status = "failed"
-                job.updated_at = time.time()
+                rec.error = f"{type(e).__name__}: {e}"
+                rec.status = "failed"
+                rec.updated_at = _utcnow()
+                self._write(rec)
 
         t = threading.Thread(target=runner, daemon=True)
         t.start()
-        return job.id
+        return job_id
 
     def get(self, job_id: str) -> Optional[Dict[str, Any]]:
-        with self._lock:
-            job = self._jobs.get(job_id)
-            return job.to_dict() if job else None
+        with self._maker() as db:
+            row = db.get(JobRecord, job_id)
+            if not row:
+                return None
+            return {
+                "id": row.id,
+                "type": row.type,
+                "status": row.status,
+                "created_at": row.created_at.isoformat() if row.created_at else None,
+                "updated_at": row.updated_at.isoformat() if row.updated_at else None,
+                "result": json.loads(row.result_json) if row.result_json else None,
+                "error": row.error,
+                "progress": row.progress or 0.0,
+                "expires_at": row.expires_at.isoformat() if row.expires_at else None,
+            }
 
     def cleanup_once(self):
-        now = time.time()
-        with self._lock:
-            to_delete = [jid for jid, j in self._jobs.items() if j.expires_at <= now]
-            for jid in to_delete:
-                try:
-                    del self._jobs[jid]
-                except Exception:
-                    pass
+        now = _utcnow()
+        with self._maker() as db:
+            try:
+                db.query(JobRecord).filter(JobRecord.expires_at <= now).delete()
+                db.commit()
+            except Exception:
+                db.rollback()
 
     def start_cleanup_daemon(self):
         if self._cleanup_started:
@@ -102,7 +126,6 @@ class JobStore:
         self._cleanup_started = True
 
 
-# Global store used by the application
 JOB_STORE = JobStore()
 
 
