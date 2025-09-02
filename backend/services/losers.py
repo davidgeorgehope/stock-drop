@@ -285,10 +285,28 @@ def market_aware_refresh_loop():
             
             # Calculate seconds until next refresh
             sleep_seconds = (next_refresh - now).total_seconds()
+            
+            # Ensure we're not sleeping for too long (max 25 hours) or negative time
+            if sleep_seconds < 0:
+                print(f"⚠️ Calculated negative sleep time ({sleep_seconds}s), scheduling for tomorrow")
+                next_refresh = next_refresh + timedelta(days=1)
+                while next_refresh.weekday() >= 5:
+                    next_refresh += timedelta(days=1)
+                sleep_seconds = (next_refresh - now).total_seconds()
+            elif sleep_seconds > 90000:  # More than 25 hours
+                print(f"⚠️ Calculated excessive sleep time ({sleep_seconds/3600:.1f}h), capping at 25 hours")
+                sleep_seconds = 90000
+            
             print(f"📅 Next losers refresh scheduled for {next_refresh.strftime('%Y-%m-%d %H:%M %Z')} ({sleep_seconds/3600:.1f} hours from now)")
             
-            # Sleep until refresh time
-            time.sleep(max(60, sleep_seconds))  # At least 1 minute
+            # Sleep until refresh time, but wake up at least every hour to check
+            while sleep_seconds > 0:
+                sleep_chunk = min(3600, sleep_seconds)  # Sleep in 1-hour chunks max
+                time.sleep(sleep_chunk)
+                sleep_seconds -= sleep_chunk
+                if sleep_seconds > 0:
+                    now = datetime.now(ZoneInfo("America/New_York"))
+                    sleep_seconds = (next_refresh - now).total_seconds()
             
             # Fetch the latest trading day's data first
             try:
@@ -316,8 +334,20 @@ def market_aware_refresh_loop():
             cleanup_old_news_cache()
             cleanup_old_og_cache()
             
-            # Sleep a bit to avoid tight loop if something goes wrong
-            time.sleep(60)
+            # Important: After a successful refresh, ensure we schedule for the NEXT trading day
+            # not immediately recalculate which might give us the same day
+            # Force scheduling for tomorrow by updating our reference time
+            now = datetime.now(ZoneInfo("America/New_York"))
+            # If we just ran, we're definitely past 5 PM, so ensure we skip to tomorrow
+            if now.hour >= 17:
+                # We just ran after 5 PM, so definitely schedule for tomorrow or next trading day
+                tomorrow = now.replace(hour=17, minute=0, second=0, microsecond=0) + timedelta(days=1)
+                while tomorrow.weekday() >= 5:  # Skip weekends
+                    tomorrow += timedelta(days=1)
+                wait_seconds = (tomorrow - now).total_seconds()
+                print(f"📅 After refresh, next run scheduled for {tomorrow.strftime('%Y-%m-%d %H:%M %Z')} ({wait_seconds/3600:.1f} hours from now)")
+                # Sleep a bit before continuing the loop to avoid any race conditions
+                time.sleep(60)
             
         except Exception as e:
             print(f"❌ Market-aware refresh error: {e}")
