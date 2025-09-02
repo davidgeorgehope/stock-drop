@@ -120,14 +120,23 @@ def _prev_business_day(d: date) -> date:
 
 
 def _determine_eod_target_date(now_utc: Optional[datetime] = None) -> date:
-    """Return strictly the previous business day in America/New_York.
-
-    This avoids 403s on free plans that cannot access today's grouped data
-    until after end of day processing is complete.
+    """Return the appropriate EOD date based on current time and market hours.
+    
+    After 5 PM ET on a trading day, returns today's date.
+    Otherwise returns the previous business day.
+    
+    This allows fetching today's EOD data after market close while avoiding
+    403s on free plans that cannot access today's grouped data during market hours.
     """
     if now_utc is None:
         now_utc = datetime.now(timezone.utc)
     ny = now_utc.astimezone(ZoneInfo("America/New_York"))
+    
+    # If it's after 5 PM ET (17:00) and today was a business day, use today
+    if ny.hour >= 17 and _is_business_day(ny.date()):
+        return ny.date()
+    
+    # Otherwise use the previous business day
     return _prev_business_day(ny.date())
 
 
