@@ -269,15 +269,16 @@ def market_aware_refresh_loop():
     """Refresh losers cache after Polygon EOD data becomes available.
     
     Polygon's daily bars are available after market close:
-    - Earliest availability: ~8pm ET (after after-hours trading ends)
+    - Earliest availability: ~8pm ET (after after-hours trading ends)  
     - Most stable/finalized data: closer to midnight ET
-    We'll fetch at 8:30pm ET for a balance between timeliness and reliability.
+    - On free tier, data often isn't available until 11pm-midnight ET
+    We'll fetch at 11:30pm ET to ensure data is available.
     """
     while True:
         try:
-            # Calculate time until next refresh (8:30pm ET for Polygon EOD data)
+            # Calculate time until next refresh (11:30pm ET for Polygon EOD data)
             now = datetime.now(ZoneInfo("America/New_York"))
-            today_refresh = now.replace(hour=20, minute=30, second=0, microsecond=0)  # 8:30pm ET
+            today_refresh = now.replace(hour=23, minute=30, second=0, microsecond=0)  # 11:30pm ET
             
             # If we're past today's refresh time, schedule for tomorrow
             if now >= today_refresh:
