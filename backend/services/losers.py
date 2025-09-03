@@ -270,14 +270,13 @@ def market_aware_refresh_loop():
     
     Polygon's daily bars are available after market close:
     - Free tier: grouped-daily endpoint for today's date unlocks after calendar day ends in ET
-    - Safe time for free users: 12:01 AM ET (next calendar day)
-    We'll fetch at 12:01 AM ET to ensure data is available on free tier.
+    - We'll fetch at 7:00 AM ET to ensure data is available on free tier
     """
     while True:
         try:
-            # Calculate time until next refresh (12:01am ET for Polygon EOD data)
+            # Calculate time until next refresh (7:00am ET for Polygon EOD data)
             now = datetime.now(ZoneInfo("America/New_York"))
-            today_refresh = now.replace(hour=0, minute=1, second=0, microsecond=0)  # 12:01am ET
+            today_refresh = now.replace(hour=7, minute=0, second=0, microsecond=0)  # 7:00am ET
             
             # If we're past today's refresh time, schedule for tomorrow
             if now >= today_refresh:

@@ -13,6 +13,9 @@ from zoneinfo import ZoneInfo
 from database.repositories.price_repo import PriceRepository
 from pydantic import BaseModel
 
+# Thread lock for Polygon API calls to prevent race conditions
+_polygon_fetch_lock = threading.Lock()
+
 
 class QuoteResponse(BaseModel):
     symbol: str
@@ -277,53 +280,61 @@ def _extract_stock_from_grouped_cache(symbol: str) -> List[dict]:
 
 
 def _fetch_polygon_grouped(date_str: str) -> list:
-    # Check memory cache first
+    # Check memory cache first (outside lock for performance)
     now = time.time()
     cached = POLYGON_GROUPED_MEMORY_CACHE.get(date_str)
     if cached and (now - cached[0]) < POLYGON_GROUPED_MEMORY_CACHE_TTL:
         print(f"Using memory cached Polygon grouped data for {date_str}")
         return cached[1]
     
-    # Check SQLite cache
-    if PriceRepository.has_data_for_date(date_str, source="polygon_grouped"):
-        print(f"Loading Polygon grouped data from SQLite for {date_str}")
-        grouped_data = PriceRepository.get_grouped_data_for_date(date_str)
-        if grouped_data:
-            # Cache in memory for quick access
-            POLYGON_GROUPED_MEMORY_CACHE[date_str] = (now, grouped_data)
-            return grouped_data
-    
-    api_key = os.getenv("POLYGON_API_KEY")
-    if not api_key:
-        print("❌ Polygon API key not set. Please set POLYGON_API_KEY in environment or .env")
-        return []
-    url = f"https://api.polygon.io/v2/aggs/grouped/locale/us/market/stocks/{date_str}?adjusted=true&apiKey={api_key}"
-    try:
-        # Rate limit Polygon API calls
-        polygon_rate_limiter.wait_if_needed()
-        resp = requests.get(url, timeout=30)
-        if resp.status_code != 200:
-            snippet = (resp.text or "").strip().replace("\n", " ")[:300]
-            print(f"❌ Polygon grouped failed for {date_str}: HTTP {resp.status_code} — {snippet}")
+    # Use lock to prevent multiple threads from fetching the same data
+    with _polygon_fetch_lock:
+        # Double-check cache inside lock in case another thread just fetched it
+        cached = POLYGON_GROUPED_MEMORY_CACHE.get(date_str)
+        if cached and (now - cached[0]) < POLYGON_GROUPED_MEMORY_CACHE_TTL:
+            print(f"Using memory cached Polygon grouped data for {date_str} (after lock)")
+            return cached[1]
+        
+        # Check SQLite cache
+        if PriceRepository.has_data_for_date(date_str, source="polygon_grouped"):
+            print(f"Loading Polygon grouped data from SQLite for {date_str}")
+            grouped_data = PriceRepository.get_grouped_data_for_date(date_str)
+            if grouped_data:
+                # Cache in memory for quick access
+                POLYGON_GROUPED_MEMORY_CACHE[date_str] = (now, grouped_data)
+                return grouped_data
+        
+        api_key = os.getenv("POLYGON_API_KEY")
+        if not api_key:
+            print("❌ Polygon API key not set. Please set POLYGON_API_KEY in environment or .env")
             return []
-        payload = resp.json() or {}
-        results = payload.get("results") or []
-        
-        # Save to SQLite
+        url = f"https://api.polygon.io/v2/aggs/grouped/locale/us/market/stocks/{date_str}?adjusted=true&apiKey={api_key}"
         try:
-            records_saved = PriceRepository.save_polygon_grouped_data(date_str, results)
-            print(f"Saved {records_saved} price records to SQLite for {date_str}")
+            # Rate limit Polygon API calls
+            polygon_rate_limiter.wait_if_needed()
+            resp = requests.get(url, timeout=30)
+            if resp.status_code != 200:
+                snippet = (resp.text or "").strip().replace("\n", " ")[:300]
+                print(f"❌ Polygon grouped failed for {date_str}: HTTP {resp.status_code} — {snippet}")
+                return []
+            payload = resp.json() or {}
+            results = payload.get("results") or []
+            
+            # Save to SQLite
+            try:
+                records_saved = PriceRepository.save_polygon_grouped_data(date_str, results)
+                print(f"Saved {records_saved} price records to SQLite for {date_str}")
+            except Exception as e:
+                print(f"Warning: Failed to save to SQLite: {e}")
+            
+            # Cache in memory
+            POLYGON_GROUPED_MEMORY_CACHE[date_str] = (now, results)
+            print(f"Cached Polygon grouped data in memory for {date_str} ({len(results)} symbols)")
+            
+            return results
         except Exception as e:
-            print(f"Warning: Failed to save to SQLite: {e}")
-        
-        # Cache in memory
-        POLYGON_GROUPED_MEMORY_CACHE[date_str] = (now, results)
-        print(f"Cached Polygon grouped data in memory for {date_str} ({len(results)} symbols)")
-        
-        return results
-    except Exception as e:
-        print(f"❌ Polygon grouped exception for {date_str}: {e}")
-        return []
+            print(f"❌ Polygon grouped exception for {date_str}: {e}")
+            return []
 
 
 def _fetch_daily_history_prefer_stooq(symbol: str) -> List[dict]:
@@ -579,14 +590,30 @@ def _fetch_yahoo_chart(symbol: str, range_: str, interval: str) -> ChartResponse
 def _fetch_biggest_losers_polygon_eod() -> List[LoserStock]:
     """Compute biggest losers from Polygon grouped EOD for the latest trading day."""
     target = _determine_eod_target_date()
-    prev = _prev_business_day(target)
     target_str = target.isoformat()
-    prev_str = prev.isoformat()
-    print(f"ℹ️ Computing EOD losers for {target_str} (prev {prev_str})")
+    
+    # Get today's data
     today_group = _fetch_polygon_grouped(target_str)
-    prev_group = _fetch_polygon_grouped(prev_str)
-    if not today_group or not prev_group:
-        print("⚠️ Missing grouped data for one or both days; returning empty losers list")
+    if not today_group:
+        print(f"⚠️ No data for target date {target_str}; returning empty losers list")
+        return []
+    
+    # Find the previous trading day with data (skip holidays/weekends)
+    prev_group = None
+    prev_date = target
+    max_lookback = 10  # Look back up to 10 days to find data
+    
+    for _ in range(max_lookback):
+        prev_date = _prev_business_day(prev_date)
+        prev_str = prev_date.isoformat()
+        print(f"ℹ️ Checking for previous day data: {prev_str}")
+        prev_group = _fetch_polygon_grouped(prev_str)
+        if prev_group:
+            print(f"ℹ️ Computing EOD losers for {target_str} vs previous trading day {prev_str}")
+            break
+    
+    if not prev_group:
+        print(f"⚠️ No previous trading day data found after checking {max_lookback} days; returning empty losers list")
         return []
     prev_close_by_ticker: Dict[str, float] = {}
     for r in prev_group:
