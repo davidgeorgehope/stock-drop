@@ -49,9 +49,9 @@ def test_openai_call(symbol: str, headlines):
     print(f"\n🤖 Testing OpenAI call for {symbol}...")
     
     # Check if API key is set
-    api_key = os.environ.get("OPENAI_API_KEY")
+    api_key = os.environ.get("XAI_API_KEY")
     if not api_key:
-        print("❌ OPENAI_API_KEY not set!")
+        print("❌ XAI_API_KEY not set!")
         return None
     
     print(f"✅ API key found: {api_key[:8]}...")
@@ -245,7 +245,7 @@ def main():
     print("\n🔧 Environment Check:")
     print(f"Python: {sys.version}")
     print(f"Working directory: {os.getcwd()}")
-    print(f"OPENAI_API_KEY: {'✅ Set' if os.environ.get('OPENAI_API_KEY') else '❌ Not set'}")
+    print(f"XAI_API_KEY: {'✅ Set' if os.environ.get('XAI_API_KEY') else '❌ Not set'}")
     print(f"DATABASE_URL: {os.environ.get('DATABASE_URL', 'Using default SQLite')}")
     
     # Test symbols from the logs
