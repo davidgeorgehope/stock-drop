@@ -36,7 +36,7 @@ def _build_llm_prompt(
 
 def _call_openai(prompt: str) -> str:
     api_key = os.getenv("XAI_API_KEY")
-    model = os.getenv("XAI_MODEL", "grok-4.3")
+    model = os.getenv("XAI_MODEL", "grok-4.7")
     if not api_key:
         # Fallback: offline snark mode
         return (
