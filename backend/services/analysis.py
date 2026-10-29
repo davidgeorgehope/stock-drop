@@ -35,8 +35,8 @@ def _build_llm_prompt(
 
 
 def _call_openai(prompt: str) -> str:
-    api_key = os.getenv("OPENAI_API_KEY")
-    model = os.getenv("OPENAI_MODEL", "gpt-4o-mini")
+    api_key = os.getenv("XAI_API_KEY")
+    model = os.getenv("XAI_MODEL", "grok-4.3")
     if not api_key:
         # Fallback: offline snark mode
         return (
@@ -44,7 +44,7 @@ def _call_openai(prompt: str) -> str:
             "analyst downgrades, or a general case of 'the market woke up on the wrong side of the bed.'"
         )
     try:
-        client = OpenAI(api_key=api_key)
+        client = OpenAI(api_key=api_key, base_url="https://api.x.ai/v1")
         resp = client.chat.completions.create(
             model=model,
             messages=[
@@ -57,7 +57,7 @@ def _call_openai(prompt: str) -> str:
         )
         return resp.choices[0].message.content or ""
     except Exception as e:
-        print(f"OpenAI call failed: {e}")
+        print(f"xAI call failed: {e}")
         return (
             "Couldn't reach the LLM this time. Still, the ingredients for a drop are classic: earnings, "
             "guidance, downgrades, macro dramas, or just vibes."

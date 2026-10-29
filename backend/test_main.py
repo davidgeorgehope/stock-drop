@@ -6,8 +6,8 @@ from fastapi.testclient import TestClient
 
 import os
 
-os.environ.setdefault("OPENAI_API_KEY", "test")
-os.environ.setdefault("OPENAI_MODEL", "gpt-4o-mini")
+os.environ.setdefault("XAI_API_KEY", "test")
+os.environ.setdefault("XAI_MODEL", "grok-4.3")
 
 from main import app  # noqa: E402
 from main import QuoteResponse, ChartResponse  # noqa: E402
